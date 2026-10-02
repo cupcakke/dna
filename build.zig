@@ -44,18 +44,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const gpu_enabled = b.option(bool, "gpu", "Enable GPU/CUDA via the Futhark CUDA backend") orelse false;
-    const zk_enabled = b.option(bool, "zk", "Compile the Circom zero-knowledge circuits") orelse false;
-    const verify_enabled = b.option(bool, "verify", "Build the Lean formal verification project") orelse false;
     const rtl_enabled = b.option(bool, "rtl", "Compile the Clash RTL modules and link the RTL simulator") orelse false;
     const skip_futhark = b.option(bool, "skip-futhark", "Assume the generated Futhark C sources are already present") orelse false;
-    const circom_lib_dir = b.option([]const u8, "circom-lib", "Directory searched for Circom includes") orelse "node_modules";
-    const ptau_entropy = b.option([]const u8, "ptau-entropy", "Entropy string for the powers-of-tau contribution") orelse "jaide-inference-trace-phase1";
     const clash_bin = b.option([]const u8, "clash", "Clash compiler executable") orelse "clash";
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "gpu_acceleration", gpu_enabled);
-    build_options.addOption(bool, "zk_enabled", zk_enabled);
-    build_options.addOption(bool, "verify_enabled", verify_enabled);
     build_options.addOption(bool, "rtl_enabled", rtl_enabled);
 
     const accel_dir = "src/hw/accel";
@@ -211,83 +205,6 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Semantically analyse every Zig module without linking");
     check_step.dependOn(&semantic_check_obj.step);
     check_step.dependOn(&distributed_check_obj.step);
-
-    if (zk_enabled) {
-        const ptau_new = b.addSystemCommand(&.{
-            "snarkjs",
-            "powersoftau",
-            "new",
-            "bn128",
-            "18",
-            "src/zk/pot18_0000.ptau",
-            "-v",
-        });
-
-        const ptau_contribute = b.addSystemCommand(&.{
-            "snarkjs",
-            "powersoftau",
-            "contribute",
-            "src/zk/pot18_0000.ptau",
-            "src/zk/pot18_0001.ptau",
-            "--name=jaide-inference-trace",
-            "-v",
-        });
-        ptau_contribute.addArg(b.fmt("-e={s}", .{ptau_entropy}));
-        ptau_contribute.step.dependOn(&ptau_new.step);
-
-        const ptau_prepare = b.addSystemCommand(&.{
-            "snarkjs",
-            "powersoftau",
-            "prepare",
-            "phase2",
-            "src/zk/pot18_0001.ptau",
-            "src/zk/pot18_final.ptau",
-            "-v",
-        });
-        ptau_prepare.step.dependOn(&ptau_contribute.step);
-
-        const circom_step = b.addSystemCommand(&.{"circom"});
-        circom_step.addArg("src/zk/inference_trace.circom");
-        circom_step.addArg("--r1cs");
-        circom_step.addArg("--wasm");
-        circom_step.addArg("--sym");
-        circom_step.addArg("-l");
-        circom_step.addArg(circom_lib_dir);
-        circom_step.addArg("-o");
-        circom_step.addArg("src/zk/");
-
-        const snarkjs_setup = b.addSystemCommand(&.{
-            "snarkjs",
-            "groth16",
-            "setup",
-            "src/zk/inference_trace.r1cs",
-            "src/zk/pot18_final.ptau",
-            "src/zk/inference_trace.zkey",
-        });
-        snarkjs_setup.step.dependOn(&circom_step.step);
-        snarkjs_setup.step.dependOn(&ptau_prepare.step);
-
-        const snarkjs_vkey = b.addSystemCommand(&.{
-            "snarkjs",
-            "zkey",
-            "export",
-            "verificationkey",
-            "src/zk/inference_trace.zkey",
-            "src/zk/verification_key.json",
-        });
-        snarkjs_vkey.step.dependOn(&snarkjs_setup.step);
-
-        const zk_step = b.step("zk", "Compile the zero-knowledge circuits and export the verification key");
-        zk_step.dependOn(&snarkjs_vkey.step);
-    }
-
-    if (verify_enabled) {
-        const lake_step = b.addSystemCommand(&.{ "lake", "build" });
-        lake_step.setCwd(b.path("src/verification"));
-
-        const verify_step = b.step("verify", "Build the Lean formal verification project");
-        verify_step.dependOn(&lake_step.step);
-    }
 
     if (rtl_enabled) {
         const clash_step = b.addSystemCommand(&.{clash_bin});

@@ -11,7 +11,6 @@ pub const fnds = @import("fnds.zig");
 pub const temporal_graph = @import("temporal_graph.zig");
 pub const c_api = @import("c_api.zig");
 pub const vpu = @import("vpu.zig");
-pub const formal_verification = @import("formal_verification.zig");
 pub const security_proofs = @import("security_proofs.zig");
 pub const type_theory = @import("type_theory.zig");
 pub const quantum_hardware = @import("quantum_hardware.zig");
@@ -21,8 +20,6 @@ pub const reasoning_orchestrator = @import("reasoning_orchestrator.zig");
 pub const safety = @import("safety.zig");
 pub const signal_propagation = @import("signal_propagation.zig");
 pub const surprise_memory = @import("surprise_memory.zig");
-pub const verified_inference_engine = @import("verified_inference_engine.zig");
-pub const zk_verification = @import("zk_verification.zig");
 pub const dataset_obfuscation = @import("dataset_obfuscation.zig");
 
 pub const SelfSimilarRelationalGraph = nsir_core.SelfSimilarRelationalGraph;
@@ -200,30 +197,6 @@ pub const JAIDE_ERROR_THREADING = c_api.JAIDE_ERROR_THREADING;
 pub const JAIDE_ERROR_UNKNOWN_GATE = c_api.JAIDE_ERROR_UNKNOWN_GATE;
 pub const JAIDE_ERROR_OUT_OF_MEMORY = c_api.JAIDE_ERROR_OUT_OF_MEMORY;
 
-pub const FormalVerificationEngine = formal_verification.FormalVerificationEngine;
-pub const InvariantType = formal_verification.InvariantType;
-pub const ProofRule = formal_verification.ProofRule;
-pub const PropType = formal_verification.PropType;
-pub const Proposition = formal_verification.Proposition;
-pub const ProofStep = formal_verification.ProofStep;
-pub const FormalProof = formal_verification.FormalProof;
-pub const Invariant = formal_verification.Invariant;
-pub const InvariantRegistry = formal_verification.InvariantRegistry;
-pub const InvariantStatistics = formal_verification.InvariantStatistics;
-pub const HoareTriple = formal_verification.HoareTriple;
-pub const HoareLogicVerifier = formal_verification.HoareLogicVerifier;
-pub const HoareStatistics = formal_verification.HoareStatistics;
-pub const TheoremProver = formal_verification.TheoremProver;
-pub const ProverStatistics = formal_verification.ProverStatistics;
-pub const Term = formal_verification.Term;
-pub const Substitution = formal_verification.Substitution;
-pub const Clause = formal_verification.Clause;
-pub const ProofTreeNode = formal_verification.ProofTreeNode;
-pub const VerificationError = formal_verification.VerificationError;
-pub const FormalVerificationResult = formal_verification.VerificationResult;
-pub const EngineStatistics = formal_verification.EngineStatistics;
-pub const PredicateFn = formal_verification.PredicateFn;
-
 pub const SecurityError = security_proofs.SecurityError;
 pub const SecurityLevel = security_proofs.SecurityLevel;
 pub const IntegrityLevel = security_proofs.IntegrityLevel;
@@ -320,7 +293,6 @@ pub const QuantumClientStatistics = quantum_hardware.QuantumClientStatistics;
 pub const QuantumClassicalHybridOptimizer = quantum_hardware.QuantumClassicalHybridOptimizer;
 
 pub const SurpriseMemoryManager = surprise_memory.SurpriseMemoryManager;
-pub const VerifiedInferenceEngine = verified_inference_engine.VerifiedInferenceEngine;
 pub const ReasoningOrchestrator = reasoning_orchestrator.ReasoningOrchestrator;
 pub const SignalPropagationEngine = signal_propagation.SignalPropagationEngine;
 

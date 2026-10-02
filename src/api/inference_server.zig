@@ -21,7 +21,6 @@ const EntangledStochasticSymmetryOptimizer = core_relational.EntangledStochastic
 const ReasoningOrchestrator = core_relational.ReasoningOrchestrator;
 const SurpriseMemoryManager = core_relational.SurpriseMemoryManager;
 const TemporalGraph = core_relational.TemporalGraph;
-const VerifiedInferenceEngine = core_relational.VerifiedInferenceEngine;
 const SignalPropagationEngine = core_relational.SignalPropagationEngine;
 const ZRuntime = core_relational.ZRuntime;
 const SelfSimilarRelationalGraph = core_relational.SelfSimilarRelationalGraph;
@@ -31,7 +30,6 @@ const RelationalGraphProcessingUnit = core_relational.RelationalGraphProcessingU
 const VPU = core_relational.VPU;
 const FNDSManager = core_relational.FNDSManager;
 const PatternLocation = core_relational.PatternLocation;
-const FormalVerificationEngine = core_relational.FormalVerificationEngine;
 const SecurityProofEngine = core_relational.SecurityProofEngine;
 const QuantumTaskAdapter = core_relational.QuantumTaskAdapter;
 const QuantumSubgraph = core_relational.QuantumSubgraph;
@@ -629,7 +627,6 @@ const LoadedInferenceState = struct {
     esso: ?EntangledStochasticSymmetryOptimizer = null,
     surprise_memory: ?SurpriseMemoryManager = null,
     temporal_graph: ?TemporalGraph = null,
-    verifier: ?*VerifiedInferenceEngine = null,
     signal_engine: ?SignalPropagationEngine = null,
     z_runtime: ?*ZRuntime = null,
     fractal_lpu: ?FractalLPU = null,
@@ -637,7 +634,6 @@ const LoadedInferenceState = struct {
     vpu: ?VPU = null,
     fnds_manager: ?FNDSManager = null,
     crev_pipeline: ?CREVPipeline = null,
-    formal_verifier: ?*FormalVerificationEngine = null,
     security_engine: ?*SecurityProofEngine = null,
     quantum_adapter: ?QuantumTaskAdapter = null,
 
@@ -667,11 +663,6 @@ const LoadedInferenceState = struct {
             self.allocator.destroy(engine);
             self.security_engine = null;
         }
-        if (self.formal_verifier) |verifier| {
-            verifier.deinit();
-            self.allocator.destroy(verifier);
-            self.formal_verifier = null;
-        }
         if (self.crev_pipeline) |*pipeline| {
             pipeline.deinit();
             self.crev_pipeline = null;
@@ -699,10 +690,6 @@ const LoadedInferenceState = struct {
         if (self.esso) |*esso| {
             esso.deinit();
             self.esso = null;
-        }
-        if (self.verifier) |verifier| {
-            verifier.deinit();
-            self.verifier = null;
         }
         if (self.chaos_kernel) |*kernel| {
             kernel.deinit();
@@ -743,7 +730,6 @@ pub const InferenceServer = struct {
     esso: ?EntangledStochasticSymmetryOptimizer,
     surprise_memory: ?SurpriseMemoryManager,
     temporal_graph: ?TemporalGraph,
-    verifier: ?*VerifiedInferenceEngine,
     signal_engine: ?SignalPropagationEngine,
     z_runtime: ?*ZRuntime,
     rate_limiter: RateLimiter,
@@ -755,7 +741,6 @@ pub const InferenceServer = struct {
     vpu: ?VPU,
     fnds_manager: ?FNDSManager,
     crev_pipeline: ?CREVPipeline,
-    formal_verifier: ?*FormalVerificationEngine,
     security_engine: ?*SecurityProofEngine,
     quantum_adapter: ?QuantumTaskAdapter,
 
@@ -790,7 +775,6 @@ pub const InferenceServer = struct {
             .esso = null,
             .surprise_memory = null,
             .temporal_graph = null,
-            .verifier = null,
             .signal_engine = null,
             .z_runtime = null,
             .request_count = std.atomic.Value(u64).init(0),
@@ -806,7 +790,6 @@ pub const InferenceServer = struct {
             .vpu = null,
             .fnds_manager = null,
             .crev_pipeline = null,
-            .formal_verifier = null,
             .security_engine = null,
             .quantum_adapter = null,
         };
@@ -832,10 +815,6 @@ pub const InferenceServer = struct {
             se.deinit();
             self.allocator.destroy(se);
         }
-        if (self.formal_verifier) |fv| {
-            fv.deinit();
-            self.allocator.destroy(fv);
-        }
         if (self.crev_pipeline) |*cp| {
             cp.deinit();
         }
@@ -856,9 +835,6 @@ pub const InferenceServer = struct {
         }
         if (self.esso) |*esso_opt| {
             esso_opt.deinit();
-        }
-        if (self.verifier) |v| {
-            v.deinit();
         }
         if (self.chaos_kernel) |*kernel| {
             kernel.deinit();
@@ -932,12 +908,6 @@ pub const InferenceServer = struct {
         staged.temporal_graph = TemporalGraph.init(self.allocator);
         staged.signal_engine = SignalPropagationEngine.init(self.allocator, &staged.nsir_graph.?, &staged.chaos_kernel.?.flow_analyzer);
 
-        if (std.posix.getenv("JAIDE_VERIFY")) |v| {
-            if (std.mem.eql(u8, v, "1")) {
-                staged.verifier = try VerifiedInferenceEngine.init(self.allocator);
-            }
-        }
-
         staged.z_runtime = try ZRuntime.init(self.allocator);
 
         staged.fractal_lpu = FractalLPU.init(self.allocator, 65536, 1.5) catch null;
@@ -947,15 +917,6 @@ pub const InferenceServer = struct {
         staged.fnds_manager = FNDSManager.init(self.allocator) catch null;
         if (staged.chaos_kernel) |*chaos_kernel| {
             staged.crev_pipeline = CREVPipeline.init(self.allocator, chaos_kernel) catch null;
-        }
-        const fv_ptr = self.allocator.create(FormalVerificationEngine) catch null;
-        if (fv_ptr) |fv| {
-            if (FormalVerificationEngine.init(self.allocator)) |fv_val| {
-                fv.* = fv_val;
-                staged.formal_verifier = fv;
-            } else |_| {
-                self.allocator.destroy(fv);
-            }
         }
         const se_ptr = self.allocator.create(SecurityProofEngine) catch null;
         if (se_ptr) |se| {
@@ -983,7 +944,6 @@ pub const InferenceServer = struct {
             .esso = self.esso,
             .surprise_memory = self.surprise_memory,
             .temporal_graph = self.temporal_graph,
-            .verifier = self.verifier,
             .signal_engine = self.signal_engine,
             .z_runtime = self.z_runtime,
             .fractal_lpu = self.fractal_lpu,
@@ -991,7 +951,6 @@ pub const InferenceServer = struct {
             .vpu = self.vpu,
             .fnds_manager = self.fnds_manager,
             .crev_pipeline = self.crev_pipeline,
-            .formal_verifier = self.formal_verifier,
             .security_engine = self.security_engine,
             .quantum_adapter = self.quantum_adapter,
         };
@@ -1005,7 +964,6 @@ pub const InferenceServer = struct {
         self.esso = staged.esso;
         self.surprise_memory = staged.surprise_memory;
         self.temporal_graph = staged.temporal_graph;
-        self.verifier = staged.verifier;
         self.signal_engine = staged.signal_engine;
         self.z_runtime = staged.z_runtime;
         self.fractal_lpu = staged.fractal_lpu;
@@ -1013,7 +971,6 @@ pub const InferenceServer = struct {
         self.vpu = staged.vpu;
         self.fnds_manager = staged.fnds_manager;
         self.crev_pipeline = staged.crev_pipeline;
-        self.formal_verifier = staged.formal_verifier;
         self.security_engine = staged.security_engine;
         self.quantum_adapter = staged.quantum_adapter;
 
@@ -1026,7 +983,6 @@ pub const InferenceServer = struct {
         staged.esso = null;
         staged.surprise_memory = null;
         staged.temporal_graph = null;
-        staged.verifier = null;
         staged.signal_engine = null;
         staged.z_runtime = null;
         staged.fractal_lpu = null;
@@ -1034,7 +990,6 @@ pub const InferenceServer = struct {
         staged.vpu = null;
         staged.fnds_manager = null;
         staged.crev_pipeline = null;
-        staged.formal_verifier = null;
         staged.security_engine = null;
         staged.quantum_adapter = null;
 
@@ -1511,14 +1466,6 @@ pub const InferenceServer = struct {
                 tg.advanceTime(after_ns - now_ns);
             }
 
-            if (self.verifier) |v| {
-                const output_buf = allocator.alloc(f32, input_tensor.data.len) catch null;
-                if (output_buf) |obuf| {
-                    defer allocator.free(obuf);
-                    v.performVerifiedInference(input_tensor.data, obuf) catch {};
-                }
-            }
-
             if (self.signal_engine) |*se| {
                 se.propagateStep() catch {};
             }
@@ -1586,12 +1533,6 @@ pub const InferenceServer = struct {
 
             if (self.crev_pipeline) |*cp| {
                 _ = cp.processTextStream(request.text) catch {};
-            }
-
-            if (self.formal_verifier) |fv| {
-                if (self.nsir_graph) |*graph| {
-                    _ = fv.verifyGraph(graph) catch {};
-                }
             }
 
             if (self.security_engine) |se| {
@@ -1938,12 +1879,6 @@ pub const InferenceServer = struct {
 
                     if (self.crev_pipeline) |*cp| {
                         _ = cp.processTextStream(batch_req.texts[ti]) catch {};
-                    }
-
-                    if (self.formal_verifier) |fv| {
-                        if (self.nsir_graph) |*graph| {
-                            _ = fv.verifyGraph(graph) catch {};
-                        }
                     }
 
                     if (self.security_engine) |se| {

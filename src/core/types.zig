@@ -1404,16 +1404,6 @@ pub const RTLSignal = struct {
     value: u64,
 };
 
-pub const ZKCircuitInput = struct {
-    public: []u8,
-    private: []u8,
-};
-
-pub const FormalProof = struct {
-    theorem: []u8,
-    proof: []u8,
-};
-
 pub const MAX_SHAPE_DIMS = 8;
 pub const MultiDimIndex = [MAX_SHAPE_DIMS]usize;
 
@@ -1445,14 +1435,6 @@ pub const RuntimeEnv = struct {
 
 pub const HardwareAccel = struct {
     rtl_modules: []RTLSignal,
-};
-
-pub const ZKProofGen = *const fn (ZKCircuitInput) []u8;
-
-pub const VerificationEnv = struct {
-    lean_proofs: []FormalProof,
-    isabelle_theories: []u8,
-    tla_specs: []u8,
 };
 
 pub const SSIHashTree = struct {
