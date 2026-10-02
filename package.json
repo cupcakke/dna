@@ -1,0 +1,16 @@
+{
+  "name": "jaide-zk",
+  "version": "40.0.0",
+  "private": true,
+  "description": "Circom circuit toolchain dependencies for the JAIDE inference trace proof system",
+  "license": "Apache-2.0",
+  "scripts": {
+    "circuits": "zig build zk -Dzk=true"
+  },
+  "dependencies": {
+    "circomlib": "^2.0.5"
+  },
+  "devDependencies": {
+    "snarkjs": "^0.7.4"
+  }
+}

@@ -1,0 +1,9 @@
+JAIDE is a foundation large language model built on the 5th root architecture paradigm, utilizing a Reversible Scatter Flow (RSF) stack of bijective, invertible cross-affine coupling layers — fundamentally distinct from all σ(W·x+b)-based architectures — which enables O(dim) memory complexity during backpropagation, hierarchical latent-space representation instead of next-token prediction, context preservation via versioned temporal graphs and surprise-based memory rather than KV cache, convergence-driven reasoning, and multi-layered gradient stability through spectral norm constraints, exp-range clipping, dynamic loss scaling, and a GradientFlowController.
+
+Ranker-Processor Hybrid Long Context: Succinct Semantic Index (SSI) Processor: Reversible Scatter-Flow (RSF) Tokenization: Morpho-Graph Tokenizer (MGT) Optimizer: Spectral Fisher Diagonalizer (SFD)
+
+Representation: Non-Sequential Information Representation (NSIR) Graph Model: Self-Similar Relational Graph (SSRG) Hardware: Relational Graph Processing Unit (R-GPU) Runtime: Chaos Core Kernel (CCK) Pipeline: Continuous Relational Extraction and Validation (CREV) Relational Optimizer: Entangled Stochastic Symmetry Optimizer (ESSO) Deployment: Fractal Network Deployment System (FNDS)
+
+Formal Verification: Formal Verification Engine (FVE) Security Verification: Security Proof Engine (SPE)
+
+RSF implements triple-signal fused learning by computing prediction, reconstruction, and Jacobian log-det losses in one reversible Futhark GPU kernel that algebraically inverts layers for O(dim) memory, then fuses them into a single mixed-precision FP16/FP32 gradient updated via SFD Fisher conditioning, spectral normalization, and global clipping to enforce accuracy, invertibility, and symplectic geometry without extra networks or passes.

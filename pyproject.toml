@@ -1,0 +1,33 @@
+[project]
+name = "jaide-bench"
+version = "40.0.0"
+description = "Modal orchestration and benchmarking harness for the JAIDE relational inference engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "JAIDE Engineering", email = "engineering@jaide.dev" },
+]
+keywords = ["jaide", "inference", "modal", "gpu", "benchmark"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "modal>=1.5.4",
+]
+
+[project.urls]
+Repository = "https://github.com/cupcakke/frouen-1"
+
+[project.scripts]
+jaide-bench = "modal_status_bench:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["scripts"]
+sources = ["scripts"]
