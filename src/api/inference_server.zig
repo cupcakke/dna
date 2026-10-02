@@ -30,7 +30,6 @@ const RelationalGraphProcessingUnit = core_relational.RelationalGraphProcessingU
 const VPU = core_relational.VPU;
 const FNDSManager = core_relational.FNDSManager;
 const PatternLocation = core_relational.PatternLocation;
-const SecurityProofEngine = core_relational.SecurityProofEngine;
 const QuantumTaskAdapter = core_relational.QuantumTaskAdapter;
 const QuantumSubgraph = core_relational.QuantumSubgraph;
 const checkpoint_schema = @import("../distributed/checkpoint_envelope.zig");
@@ -634,7 +633,6 @@ const LoadedInferenceState = struct {
     vpu: ?VPU = null,
     fnds_manager: ?FNDSManager = null,
     crev_pipeline: ?CREVPipeline = null,
-    security_engine: ?*SecurityProofEngine = null,
     quantum_adapter: ?QuantumTaskAdapter = null,
 
     fn deinit(self: *LoadedInferenceState) void {
@@ -657,11 +655,6 @@ const LoadedInferenceState = struct {
         if (self.quantum_adapter) |*adapter| {
             adapter.deinit();
             self.quantum_adapter = null;
-        }
-        if (self.security_engine) |engine| {
-            engine.deinit();
-            self.allocator.destroy(engine);
-            self.security_engine = null;
         }
         if (self.crev_pipeline) |*pipeline| {
             pipeline.deinit();
@@ -741,7 +734,6 @@ pub const InferenceServer = struct {
     vpu: ?VPU,
     fnds_manager: ?FNDSManager,
     crev_pipeline: ?CREVPipeline,
-    security_engine: ?*SecurityProofEngine,
     quantum_adapter: ?QuantumTaskAdapter,
 
     pub fn init(allocator: Allocator, config: ServerConfig) !InferenceServer {
@@ -790,7 +782,6 @@ pub const InferenceServer = struct {
             .vpu = null,
             .fnds_manager = null,
             .crev_pipeline = null,
-            .security_engine = null,
             .quantum_adapter = null,
         };
     }
@@ -810,10 +801,6 @@ pub const InferenceServer = struct {
         }
         if (self.quantum_adapter) |*qa| {
             qa.deinit();
-        }
-        if (self.security_engine) |se| {
-            se.deinit();
-            self.allocator.destroy(se);
         }
         if (self.crev_pipeline) |*cp| {
             cp.deinit();
@@ -918,14 +905,6 @@ pub const InferenceServer = struct {
         if (staged.chaos_kernel) |*chaos_kernel| {
             staged.crev_pipeline = CREVPipeline.init(self.allocator, chaos_kernel) catch null;
         }
-        const se_ptr = self.allocator.create(SecurityProofEngine) catch null;
-        if (se_ptr) |se| {
-            var security_committed = false;
-            errdefer if (!security_committed) self.allocator.destroy(se);
-            se.* = try SecurityProofEngine.init(self.allocator, .INTERNAL);
-            staged.security_engine = se;
-            security_committed = true;
-        }
         if (staged.nsir_graph) |*graph| {
             staged.quantum_adapter = QuantumTaskAdapter.init(self.allocator, graph);
         }
@@ -951,7 +930,6 @@ pub const InferenceServer = struct {
             .vpu = self.vpu,
             .fnds_manager = self.fnds_manager,
             .crev_pipeline = self.crev_pipeline,
-            .security_engine = self.security_engine,
             .quantum_adapter = self.quantum_adapter,
         };
 
@@ -971,7 +949,6 @@ pub const InferenceServer = struct {
         self.vpu = staged.vpu;
         self.fnds_manager = staged.fnds_manager;
         self.crev_pipeline = staged.crev_pipeline;
-        self.security_engine = staged.security_engine;
         self.quantum_adapter = staged.quantum_adapter;
 
         staged.model = null;
@@ -990,7 +967,6 @@ pub const InferenceServer = struct {
         staged.vpu = null;
         staged.fnds_manager = null;
         staged.crev_pipeline = null;
-        staged.security_engine = null;
         staged.quantum_adapter = null;
 
         previous.deinit();
@@ -1535,12 +1511,6 @@ pub const InferenceServer = struct {
                 _ = cp.processTextStream(request.text) catch {};
             }
 
-            if (self.security_engine) |se| {
-                if (self.nsir_graph) |*graph| {
-                    _ = se.proveInformationFlowSecurity(graph) catch {};
-                }
-            }
-
             if (self.quantum_adapter) |*qa| {
                 var subgraphs_opt = qa.identifyQuantumSubgraphs() catch null;
                 if (subgraphs_opt) |*sgs| {
@@ -1879,12 +1849,6 @@ pub const InferenceServer = struct {
 
                     if (self.crev_pipeline) |*cp| {
                         _ = cp.processTextStream(batch_req.texts[ti]) catch {};
-                    }
-
-                    if (self.security_engine) |se| {
-                        if (self.nsir_graph) |*graph| {
-                            _ = se.proveInformationFlowSecurity(graph) catch {};
-                        }
                     }
 
                     if (self.quantum_adapter) |*qa| {
