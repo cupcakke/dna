@@ -464,18 +464,7 @@ pub const SSI = struct {
         }
     }
 
-    pub fn addSequence(self: *SSI, tokens: []const u32, position: u64, is_anchor: bool) !void {
-        const anchor_hash = if (is_anchor) computeAnchorHash(tokens, position) else 0;
-        try self.addSequenceWithMetadata(tokens, position, 0.0, anchor_hash, &.{}, 0.0, 0);
-        if (self.size > 0) {
-            const load_factor = @as(f64, @floatFromInt(self.size)) / @as(f64, @floatFromInt(bucket_count));
-            if (load_factor > 8.0) {
-                try self.compact();
-            }
-        }
-    }
-
-    pub fn addSequenceWithLatent(self: *SSI, tokens: []const u32, position: u64, is_anchor: bool, latent: []const f32, log_det: f32) !void {
+    fn addSequenceWithLatent(self: *SSI, tokens: []const u32, position: u64, is_anchor: bool, latent: []const f32, log_det: f32) !void {
         if (latent.len < 2 or latent.len % 2 != 0) return Error.InvalidShape;
         const dim = latent.len / 2;
         try self.adoptIdentity(dim, self.model_id, self.global_diffusion);

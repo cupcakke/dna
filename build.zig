@@ -8,8 +8,7 @@ const AccelConfig = struct {
     codegen: ?*std.Build.Step,
     gpu: bool,
     options: *std.Build.Step.Options,
-    core_relational: *std.Build.Module,
-    tensor_core: *std.Build.Module,
+    jaide: *std.Build.Module,
 };
 
 fn linkCudaRuntime(artifact: *std.Build.Step.Compile, with_nccl: bool) void {
@@ -35,8 +34,7 @@ fn applyAccel(artifact: *std.Build.Step.Compile, cfg: AccelConfig, with_nccl: bo
     if (cfg.codegen) |step| artifact.step.dependOn(step);
     if (cfg.gpu) linkCudaRuntime(artifact, with_nccl);
     artifact.root_module.addOptions("build_options", cfg.options);
-    artifact.root_module.addImport("core_relational", cfg.core_relational);
-    artifact.root_module.addImport("tensor_core_matmul", cfg.tensor_core);
+    artifact.root_module.addImport("jaide", cfg.jaide);
 }
 
 pub fn build(b: *std.Build) void {
@@ -90,26 +88,12 @@ pub fn build(b: *std.Build) void {
     const cpu_cflags = [_][]const u8{ "-O2", "-std=c11" };
     const gpu_cflags = [_][]const u8{ "-O2", "-std=c11", "-DJAIDE_FUTHARK_CUDA" };
 
-    const core_relational_mod = b.createModule(.{
-        .root_source_file = b.path("src/core_relational/mod.zig"),
+    const jaide_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    core_relational_mod.addOptions("build_options", build_options);
-
-    const tensor_core_mod = b.createModule(.{
-        .root_source_file = b.path("src/hw/accel/tensor_core_matmul.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    tensor_core_mod.addOptions("build_options", build_options);
-
-    const tokenizer_mod = b.createModule(.{
-        .root_source_file = b.path("src/tokenizer/mgt.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    tokenizer_mod.addOptions("build_options", build_options);
+    jaide_mod.addOptions("build_options", build_options);
 
     const accel: AccelConfig = .{
         .include = futhark_include,
@@ -119,8 +103,7 @@ pub fn build(b: *std.Build) void {
         .codegen = if (skip_futhark) null else if (gpu_enabled) &main_gpu_step.step else &main_cpu_step.step,
         .gpu = gpu_enabled,
         .options = build_options,
-        .core_relational = core_relational_mod,
-        .tensor_core = tensor_core_mod,
+        .jaide = jaide_mod,
     };
 
     const inference_server_exe = b.addExecutable(.{
@@ -158,9 +141,7 @@ pub fn build(b: *std.Build) void {
     });
     pretokenize_exe.linkLibC();
     pretokenize_exe.root_module.addOptions("build_options", build_options);
-    pretokenize_exe.root_module.addImport("core_relational", core_relational_mod);
-    pretokenize_exe.root_module.addImport("tensor_core_matmul", tensor_core_mod);
-    pretokenize_exe.root_module.addImport("tokenizer", tokenizer_mod);
+
     b.installArtifact(pretokenize_exe);
     const pretokenize_step = b.step("pretokenize", "Build the binary dataset pre-tokenizer");
     pretokenize_step.dependOn(&pretokenize_exe.step);
@@ -187,8 +168,6 @@ pub fn build(b: *std.Build) void {
     semantic_check_obj.linkLibC();
     semantic_check_obj.addIncludePath(futhark_include);
     semantic_check_obj.root_module.addOptions("build_options", build_options);
-    semantic_check_obj.root_module.addImport("core_relational", core_relational_mod);
-    semantic_check_obj.root_module.addImport("tensor_core_matmul", tensor_core_mod);
 
     const distributed_check_obj = b.addObject(.{
         .name = "jaide-distributed-check",
@@ -199,12 +178,22 @@ pub fn build(b: *std.Build) void {
     distributed_check_obj.linkLibC();
     distributed_check_obj.addIncludePath(futhark_include);
     distributed_check_obj.root_module.addOptions("build_options", build_options);
-    distributed_check_obj.root_module.addImport("core_relational", core_relational_mod);
-    distributed_check_obj.root_module.addImport("tensor_core_matmul", tensor_core_mod);
 
     const check_step = b.step("check", "Semantically analyse every Zig module without linking");
     check_step.dependOn(&semantic_check_obj.step);
     check_step.dependOn(&distributed_check_obj.step);
+
+    const rsf_substrate_tests = b.addTest(.{
+        .name = "rsf-substrate-tests",
+        .root_source_file = b.path("src/tests/rsf_substrate_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rsf_substrate_tests.root_module.addOptions("build_options", build_options);
+    rsf_substrate_tests.root_module.addImport("jaide", jaide_mod);
+    const run_rsf_substrate_tests = b.addRunArtifact(rsf_substrate_tests);
+    const test_rsf_step = b.step("test-rsf", "Run the RSF tensor, causal, and spectral substrate tests");
+    test_rsf_step.dependOn(&run_rsf_substrate_tests.step);
 
     if (rtl_enabled) {
         const clash_step = b.addSystemCommand(&.{clash_bin});
@@ -248,6 +237,7 @@ pub fn build(b: *std.Build) void {
         });
         rtl_exe.linkLibC();
         rtl_exe.root_module.addOptions("build_options", build_options);
+        rtl_exe.root_module.addImport("jaide", jaide_mod);
         rtl_exe.addLibraryPath(b.path("src/hw/rtl"));
         rtl_exe.linkSystemLibrary("rtl_sim");
         rtl_exe.addRPath(b.path("src/hw/rtl"));
@@ -268,8 +258,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bench_deps.addOptions("build_options", build_options);
-    bench_deps.addImport("core_relational", core_relational_mod);
-    bench_deps.addImport("tensor_core_matmul", tensor_core_mod);
+    bench_deps.addImport("jaide", jaide_mod);
 
     const bench_step = b.step("bench", "Run every benchmark");
 

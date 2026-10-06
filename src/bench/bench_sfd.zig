@@ -1,20 +1,16 @@
 const std = @import("std");
 const deps = @import("deps");
 const core = deps.core_tensor;
-const Tensor = deps.sfd.Tensor;
+const Tensor = deps.core_tensor.Tensor;
+const RSF = deps.rsf.RSF;
 const SpectralNormalizer = deps.sfd.SpectralNormalizer;
 
-// FP4 quantization constants
-const QUANT_N: usize = 1 << 20; // 1M values
+const QUANT_N: usize = 1 << 20;
 const QUANT_ITERS: usize = 100;
 
-// Spectral normalizer constants
 const WEIGHT_DIM: usize = 512;
 const SPECTRAL_ITERS: usize = 50;
-const POWER_ITERS_FULL: usize = 20;
-const POWER_ITERS_SPARSE: usize = 5;
 
-// FP4 quantization logic (replicated from sfd.zig since quantizeValue is private)
 fn quantizeFP4(value: f32) f32 {
     if (!std.math.isFinite(value)) return value;
     const clamped = std.math.clamp(value, -6.0, 6.0);
@@ -49,7 +45,6 @@ pub fn main() !void {
     std.debug.print("BENCHMARK: SFD Optimizations (FP4 quantization + SpectralNorm)\n", .{});
     std.debug.print("================================================================================\n", .{});
 
-    // --- FP4 quantization benchmark ---
     {
         std.debug.print("Config: quant_n={d}, iters={d}\n", .{ QUANT_N, QUANT_ITERS });
         std.debug.print("--------------------------------------------------------------------------------\n", .{});
@@ -59,14 +54,12 @@ pub fn main() !void {
         const output = try allocator.alloc(f32, QUANT_N);
         defer allocator.free(output);
 
-        // Fill with linearly spaced values from -6.0 to 6.0
         var i: usize = 0;
         while (i < QUANT_N) : (i += 1) {
             const t_val: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(QUANT_N - 1));
             input[i] = -6.0 + 12.0 * t_val;
         }
 
-        // Timed
         var timer = try std.time.Timer.start();
         var iter: usize = 0;
         while (iter < QUANT_ITERS) : (iter += 1) {
@@ -88,71 +81,37 @@ pub fn main() !void {
         std.debug.print("--------------------------------------------------------------------------------\n", .{});
     }
 
-    // --- SpectralNormalizer benchmark ---
     {
-        std.debug.print("Config: weight_dim={d}, iters={d}, power_iters_full={d}, power_iters_sparse={d}\n", .{ WEIGHT_DIM, SPECTRAL_ITERS, POWER_ITERS_FULL, POWER_ITERS_SPARSE });
+        std.debug.print("Config: coupling_dim={d}, iterations={d}, method=exact_rank2\n", .{ WEIGHT_DIM, SPECTRAL_ITERS });
         std.debug.print("--------------------------------------------------------------------------------\n", .{});
-
-        const dims = [_]usize{ WEIGHT_DIM, WEIGHT_DIM };
-
-        // Fill with deterministic pseudo-random values
+        var model = try RSF.init(allocator, WEIGHT_DIM, 1);
+        defer model.deinit();
+        var weights = try Tensor.initCoupling(allocator, .{
+            .space = .layer_weight_s,
+            .model_id = model.id,
+            .layer_index = 0,
+            .dim = WEIGHT_DIM,
+        });
+        defer weights.deinit();
         var prng = std.Random.DefaultPrng.init(42);
-        const random = prng.random();
-
-        // Save initial values for reset
-        const initial_data = try allocator.alloc(f32, WEIGHT_DIM * WEIGHT_DIM);
-        defer allocator.free(initial_data);
-        for (initial_data) |*v| {
-            v.* = random.float(f32) * 2.0 - 1.0;
-        }
-
-        // Benchmark with full power iterations
-        var weights_full = try Tensor.init(allocator, &dims);
-        defer weights_full.deinit();
-
-        var normalizer_full = SpectralNormalizer.init(POWER_ITERS_FULL);
-
-        var full_timer = try std.time.Timer.start();
+        for (weights.data) |*value| value.* = prng.random().float(f32) * 2.0 - 1.0;
+        var normalizer = SpectralNormalizer.init();
+        var timer = try std.time.Timer.start();
         var iter: usize = 0;
         while (iter < SPECTRAL_ITERS) : (iter += 1) {
-            @memcpy(weights_full.data, initial_data);
-            try normalizer_full.normalizeWeights(&weights_full, allocator);
+            for (weights.data, 0..) |*value, i| value.* = @as(f32, @floatFromInt((i % 17) + 1)) * 0.01;
+            try normalizer.normalizeWeights(&weights, allocator);
         }
-        const full_ns = full_timer.read();
-        const full_ms = @as(f64, @floatFromInt(full_ns)) / 1_000_000.0;
-        const full_per_iter = full_ms / @as(f64, @floatFromInt(SPECTRAL_ITERS));
-
-        std.debug.print("[SpectralNorm power_iterations={d}]\n", .{POWER_ITERS_FULL});
-        std.debug.print("  Total time:        {d:.2} ms\n", .{full_ms});
-        std.debug.print("  Per iteration:     {d:.2} ms\n", .{full_per_iter});
-        std.debug.print("--------------------------------------------------------------------------------\n", .{});
-
-        // Benchmark with sparse power iterations
-        var weights_sparse = try Tensor.init(allocator, &dims);
-        defer weights_sparse.deinit();
-
-        var normalizer_sparse = SpectralNormalizer.init(POWER_ITERS_SPARSE);
-
-        var sparse_timer = try std.time.Timer.start();
-        iter = 0;
-        while (iter < SPECTRAL_ITERS) : (iter += 1) {
-            @memcpy(weights_sparse.data, initial_data);
-            try normalizer_sparse.normalizeWeights(&weights_sparse, allocator);
-        }
-        const sparse_ns = sparse_timer.read();
-        const sparse_ms = @as(f64, @floatFromInt(sparse_ns)) / 1_000_000.0;
-        const sparse_per_iter = sparse_ms / @as(f64, @floatFromInt(SPECTRAL_ITERS));
-
-        std.debug.print("[SpectralNorm power_iterations={d}]\n", .{POWER_ITERS_SPARSE});
-        std.debug.print("  Total time:        {d:.2} ms\n", .{sparse_ms});
-        std.debug.print("  Per iteration:     {d:.2} ms\n", .{sparse_per_iter});
-        std.debug.print("--------------------------------------------------------------------------------\n", .{});
-
-        const speedup = if (sparse_per_iter > 0) full_per_iter / sparse_per_iter else 0;
-        std.debug.print("Speedup ratio (full/sparse): {d:.2}x\n", .{speedup});
+        const elapsed_ns = timer.read();
+        const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+        const per_iter = elapsed_ms / @as(f64, @floatFromInt(SPECTRAL_ITERS));
+        const sigma = try core.exactSpectralNormRank2(weights.data, WEIGHT_DIM);
+        std.debug.print("[SpectralNorm exact_rank2]\n", .{});
+        std.debug.print("  Total time:        {d:.2} ms\n", .{elapsed_ms});
+        std.debug.print("  Per iteration:     {d:.2} ms\n", .{per_iter});
+        std.debug.print("  Final exact sigma:  {d:.6}\n", .{sigma});
         std.debug.print("--------------------------------------------------------------------------------\n", .{});
     }
 
     std.debug.print("RESULT: PASS\n", .{});
 }
-

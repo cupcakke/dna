@@ -2242,7 +2242,7 @@ pub const RelationalGraphProcessingUnit = struct {
         const bitmask = try local_graph.exportAdjacencyBitmask(node_list.items, self.allocator);
         defer self.allocator.free(bitmask);
 
-        nsir_core.bitmaskSignalPropagate(bitmask, node_count, signal[0..node_count], decay, out[0..node_count]);
+        nsir_core.bitmaskSignalPropagateBitPlane(bitmask, node_count, signal[0..node_count], decay, out[0..node_count]);
 
         core.cycles_active += 1;
         core.energy_consumed += 1.0;
@@ -2268,8 +2268,9 @@ pub const RelationalGraphProcessingUnit = struct {
             const offset = offset_per_core[core_id];
             const count = count_per_core[core_id];
             if (count == 0) continue;
-            if (offset + count > signals.len or offset + count > out.len) return error.SignalShapeMismatch;
-            total_processed += try self.propagateCoreSignalBitmask(core_id, signals[offset .. offset + count], decay, out[offset .. offset + count]);
+            const end = std.math.add(usize, offset, count) catch return error.SignalShapeMismatch;
+            if (end > signals.len or end > out.len) return error.SignalShapeMismatch;
+            total_processed += try self.propagateCoreSignalBitmask(core_id, signals[offset..end], decay, out[offset..end]);
         }
         return total_processed;
     }

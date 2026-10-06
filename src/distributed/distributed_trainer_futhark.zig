@@ -517,7 +517,6 @@ const StepSynchronizer = struct {
             const spectral_started = std.time.nanoTimestamp();
             try trainer.accelerator.spectralNormalizeLayers(
                 trainer.config.spectral_target_norm,
-                trainer.config.spectral_iterations,
             );
             try trainer.applyEmbeddingSpectralNormalization();
             if (trainer.coordinator.isRoot()) {
@@ -744,7 +743,7 @@ pub const DistributedTrainerFuthark = struct {
         );
         if (config.init_spectral_iterations > 0) {
             std.debug.print("[Trainer] init spectral normalize iters={d}\n", .{config.init_spectral_iterations});
-            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm, config.init_spectral_iterations);
+            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm);
         }
         std.debug.print(
             "[Trainer] allocating embeddings vocab={d} dim={d}\n",
@@ -801,7 +800,6 @@ pub const DistributedTrainerFuthark = struct {
         var fnds_manager_committed = false;
         errdefer if (!fnds_manager_committed) fnds_manager_inst.deinit();
         const spectral_normalizer = sfd.SpectralNormalizer.initWithConfig(.{
-            .power_iterations = config.spectral_iterations,
             .max_singular_value = config.spectral_target_norm,
         });
         var knowledge_graph_nonce: [32]u8 = undefined;
@@ -2510,7 +2508,6 @@ pub const DistributedTrainerFuthark = struct {
         self.shuffle_mutex.unlock();
         self.relational_fast_mode = saved_relational_fast_mode == 1;
         self.spectral_normalizer = sfd.SpectralNormalizer.initWithConfig(.{
-            .power_iterations = saved_spectral_iterations,
             .max_singular_value = saved_spectral_target,
         });
         self.knowledge_graph_nonce = loaded_nonce;
@@ -2556,7 +2553,7 @@ pub const DistributedTrainerFuthark = struct {
         const embedding = &self.gpu_embedding.?;
         const rows = embedding.vocab_size;
         const columns = embedding.dim;
-        if (rows == 0 or columns == 0 or self.spectral_normalizer.power_iterations == 0) return;
+        if (rows == 0 or columns == 0 or self.config.spectral_iterations == 0) return;
         try self.ensureSpectralState(rows, columns);
         const u = &self.gpu_spectral_u.?;
         const v = &self.gpu_spectral_v.?;
@@ -2567,7 +2564,7 @@ pub const DistributedTrainerFuthark = struct {
             try embedding.spectralNormalize(
                 u,
                 v,
-                self.spectral_normalizer.power_iterations,
+                self.config.spectral_iterations,
                 self.spectral_normalizer.max_singular_value,
             );
         }

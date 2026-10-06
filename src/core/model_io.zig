@@ -566,14 +566,16 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
 
         const seed = try ranker_reader.readInt(u64, .little);
 
-        ranker.* = Ranker{
-            .ngram_weights = ngram_weights_alloc,
-            .lsh_hash_params = lsh_hash_params,
-            .num_hash_functions = num_hash_funcs,
-            .num_ngrams = num_weights,
-            .seed = seed,
-            .allocator = allocator,
-        };
+        const ranker_model = model.rsf orelse return ModelError.MissingComponent;
+        var ranker_value = try Ranker.init(allocator, num_weights, num_hash_funcs, seed, ranker_model);
+        errdefer ranker_value.deinit();
+        allocator.free(ranker_value.ngram_weights);
+        allocator.free(ranker_value.lsh_hash_params);
+        ranker_value.ngram_weights = ngram_weights_alloc;
+        ranker_value.lsh_hash_params = lsh_hash_params;
+        ranker_value.num_ngrams = num_weights;
+        ranker_value.num_hash_functions = num_hash_funcs;
+        ranker.* = ranker_value;
 
         if (ranker_comp_reader.bytes_read != ranker_len) {
             ranker.deinit();
@@ -698,7 +700,6 @@ pub fn loadSFDState(optimizer: *sfd.SFD, path: []const u8) !void {
     try optimizer.loadState(path);
 }
 
-// deprecated: use inline checkpoint serialization in distributed_trainer_futhark.zig
 pub fn saveNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8) !void {
     var file = try fs.cwd().createFile(path, .{});
     defer file.close();
@@ -749,7 +750,6 @@ pub fn saveNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8) 
     try buffered.flush();
 }
 
-// deprecated: use inline checkpoint serialization in distributed_trainer_futhark.zig
 pub fn loadNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8, allocator: Allocator) !void {
     const file = try fs.cwd().openFile(path, .{});
     defer file.close();

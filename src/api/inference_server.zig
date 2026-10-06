@@ -5,6 +5,7 @@ const fs = std.fs;
 const Thread = std.Thread;
 const Allocator = mem.Allocator;
 const RSF = @import("../processor/rsf.zig").RSF;
+const RSFLatentState = @import("../processor/rsf.zig").RSFLatentState;
 const RSFLayer = @import("../processor/rsf.zig").RSFLayer;
 const Ranker = @import("../ranker/ranker.zig").Ranker;
 const MGT = @import("../tokenizer/mgt.zig").MGT;
@@ -864,12 +865,10 @@ pub const InferenceServer = struct {
         staged.model.?.embedding = null;
 
         staged.ssi = SSI.init(self.allocator);
-        staged.ranker = try Ranker.init(self.allocator, 3, 8, 42);
 
-        const dim = if (staged.model.?.rsf) |rsf|
-            (rsf.ctrl orelse return error.MissingRSFControl).dim
-        else
-            256;
+        const base_rsf = staged.model.?.rsf orelse return error.MissingRSFControl;
+        staged.ranker = try Ranker.init(self.allocator, 3, 8, 42, base_rsf);
+        const dim = (base_rsf.ctrl orelse return error.MissingRSFControl).dim;
 
         const source_vocab_size: usize = blk: {
             if (staged.model.?.mgt) |mgt| {
@@ -1377,6 +1376,23 @@ pub const InferenceServer = struct {
                 return;
             };
 
+            if (self.ssi) |*ssi_idx| {
+                if (self.model.?.rsf) |base_model| {
+                    var latent_state = RSFLatentState.init(allocator, base_model, 1) catch null;
+                    if (latent_state) |*state| {
+                        defer state.deinit();
+                        if (input_tensor.data.len >= dim * 2) {
+                            for (0..dim) |d| {
+                                state.data.data[d * 2] = input_tensor.data[d];
+                                state.data.data[d * 2 + 1] = input_tensor.data[dim + d];
+                            }
+                            const is_anchor = (self.request_count.load(.monotonic) % 10 == 0);
+                            ssi_idx.addLatent(base_model, state, final_tokens, self.request_count.load(.monotonic), is_anchor) catch {};
+                        }
+                    }
+                }
+            }
+
             if (self.nsir_graph) |*graph| {
                 const tensor_bytes = std.mem.sliceAsBytes(input_tensor.data);
                 _ = graph.encodeInformation(tensor_bytes) catch {};
@@ -1536,11 +1552,6 @@ pub const InferenceServer = struct {
                 embeddings.?[m] = if (m < input_tensor.data.len) input_tensor.data[m] else 0.0;
             }
         }
-
-        if (self.ssi) |*ssi_idx| {
-            const is_anchor = (self.request_count.load(.monotonic) % 10 == 0);
-            ssi_idx.addSequence(final_tokens, self.request_count.load(.monotonic), is_anchor) catch {};
-        }
         _ = self.request_count.fetchAdd(1, .monotonic);
 
         var owned_embeddings: ?[]f32 = embeddings;
@@ -1610,17 +1621,22 @@ pub const InferenceServer = struct {
 
             if (self.ssi) |*ssi_idx| {
                 if (self.ranker) |*rnk| {
-                    const top_candidates = rnk.topKHeap(ssi_idx, generated.items, 5, allocator) catch null;
-                    if (top_candidates) |cands| {
-                        defer {
-                            for (cands) |*c| {
-                                c.deinit(allocator);
+                    if (self.model.?.rsf) |base_model| {
+                        var query_state = RSFLatentState.init(allocator, base_model, 1) catch null;
+                        if (query_state) |*state| {
+                            defer state.deinit();
+                            const top_candidates = rnk.topKHeap(ssi_idx, generated.items, state, base_model, 5, allocator) catch null;
+                            if (top_candidates) |cands| {
+                                defer {
+                                    for (cands) |*c| {
+                                        c.deinit(allocator);
+                                    }
+                                    allocator.free(cands);
+                                }
+                                if (cands.len > 0 and cands[0].tokens.len > 0) {
+                                    next_token = cands[0].tokens[0];
+                                }
                             }
-                            allocator.free(cands);
-                        }
-                        if (cands.len > 0 and cands[0].tokens.len > 0) {
-                            rnk.rankCandidatesWithQuery(cands, generated.items, ssi_idx, allocator) catch {};
-                            next_token = cands[0].tokens[0];
                         }
                     }
                 }
@@ -1660,10 +1676,6 @@ pub const InferenceServer = struct {
             if (next_token == 0) break;
 
             try generated.append(next_token);
-
-            if (self.ssi) |*ssi_idx| {
-                ssi_idx.addSequence(&[_]u32{next_token}, self.request_count.load(.monotonic), false) catch {};
-            }
         }
 
         var generated_text: ?[]const u8 = null;
@@ -1787,6 +1799,23 @@ pub const InferenceServer = struct {
                     defer input_tensor.deinit();
 
                     self.model.?.rsf.?.forward(&input_tensor) catch {};
+
+                    if (self.ssi) |*ssi_idx| {
+                        if (self.model.?.rsf) |base_model| {
+                            var latent_state = RSFLatentState.init(allocator, base_model, 1) catch null;
+                            if (latent_state) |*state| {
+                                defer state.deinit();
+                                if (input_tensor.data.len >= dim * 2) {
+                                    for (0..dim) |d| {
+                                        state.data.data[d * 2] = input_tensor.data[d];
+                                        state.data.data[d * 2 + 1] = input_tensor.data[dim + d];
+                                    }
+                                    const is_anchor = (self.request_count.load(.monotonic) % 10 == 0);
+                                    ssi_idx.addLatent(base_model, state, tokens.items, self.request_count.load(.monotonic), is_anchor) catch {};
+                                }
+                            }
+                        }
+                    }
 
                     if (self.nsir_graph) |*graph| {
                         const tensor_bytes = std.mem.sliceAsBytes(input_tensor.data);
@@ -1922,17 +1951,22 @@ pub const InferenceServer = struct {
 
                 if (self.ssi) |*ssi_idx| {
                     if (self.ranker) |*rnk| {
-                        const top_candidates = rnk.topKHeap(ssi_idx, generated.items, 5, allocator) catch null;
-                        if (top_candidates) |cands| {
-                            defer {
-                                for (cands) |*c| {
-                                    c.deinit(allocator);
+                        if (self.model.?.rsf) |base_model| {
+                            var query_state = RSFLatentState.init(allocator, base_model, 1) catch null;
+                            if (query_state) |*state| {
+                                defer state.deinit();
+                                const top_candidates = rnk.topKHeap(ssi_idx, generated.items, state, base_model, 5, allocator) catch null;
+                                if (top_candidates) |cands| {
+                                    defer {
+                                        for (cands) |*c| {
+                                            c.deinit(allocator);
+                                        }
+                                        allocator.free(cands);
+                                    }
+                                    if (cands.len > 0 and cands[0].tokens.len > 0) {
+                                        next_token = cands[0].tokens[0];
+                                    }
                                 }
-                                allocator.free(cands);
-                            }
-                            if (cands.len > 0 and cands[0].tokens.len > 0) {
-                                rnk.rankCandidatesWithQuery(cands, generated.items, ssi_idx, allocator) catch {};
-                                next_token = cands[0].tokens[0];
                             }
                         }
                     }
@@ -1971,10 +2005,6 @@ pub const InferenceServer = struct {
 
                 if (next_token == 0) break;
                 try generated.append(next_token);
-
-                if (self.ssi) |*ssi_idx| {
-                    ssi_idx.addSequence(&[_]u32{next_token}, self.request_count.load(.monotonic), false) catch {};
-                }
             }
 
             self.inference_mutex.unlock();

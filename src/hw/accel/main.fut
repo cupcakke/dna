@@ -241,11 +241,9 @@ let sfd_block_2x2_update (w: [2]f32) (g: [2]f32) (m: [2]f32) (f: [3]f32)
   let b = fwb_hat
   let c = fbb_hat + lam
   let det = f32.max 1e-12f32 (a * c - b * b)
-  let sd = f32.sqrt det
-  let s = f32.sqrt (f32.max 0f32 (a + c + 2f32 * sd))
-  let alpha = 1f32 / (sd * f32.max s 1e-12f32)
-  let raw_w = alpha * ((c + sd) * mw_hat - b * mb_hat) * safe_lr
-  let raw_b = alpha * ((-b) * mw_hat + (a + sd) * mb_hat) * safe_lr
+  let inv_det = 1f32 / det
+  let raw_w = ((c * mw_hat - b * mb_hat) * inv_det) * safe_lr
+  let raw_b = ((-b * mw_hat + a * mb_hat) * inv_det) * safe_lr
   let ww = sanitize_f32 w[0]
   let wb = sanitize_f32 w[1]
   let max_w = safe_trust * f32.max safe_floor (f32.abs ww)
@@ -805,7 +803,7 @@ let causal_key_row [seq_len][half]
   map (\d ->
     let acc = loop s = 0f32 for t' < seq_len do
       s + f32.bool (bitmask[t][t'] != 0u8) * x2[t'][d]
-    in acc + x2[t][d]) (iota half)
+    in acc) (iota half)
 
 let causal_oftb_forward_row [half]
   (y1: [half]f32) (y2: [half]f32)
