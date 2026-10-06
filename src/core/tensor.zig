@@ -861,8 +861,8 @@ fn workerMain(context: *GemmContext, worker_id: usize) void {
                 const ic = block_index * MC;
                 if (ic >= context.m) break;
                 const mc = @min(MC, context.m - ic);
-                
-                
+
+
                 const packed_a_len = @as(usize, mc) * @as(usize, kc);
                 packA(context.a[ic * context.lda + pc ..], context.lda, mc, kc, packed_a_storage[0..packed_a_len]);
                 var jr: usize = 0;
@@ -1289,6 +1289,7 @@ pub const Tensor = struct {
     refcount: *usize,
     cow: *bool,
     huge_allocator_owner: ?*HugePageAllocator,
+    rsf: ?types.RSFBinding = null,
 
     pub fn init(allocator: Allocator, dims: []const usize) !Tensor {
         var shape = try Shape.init(allocator, dims);
@@ -1302,7 +1303,7 @@ pub const Tensor = struct {
         const cow = try allocator.create(bool);
         errdefer allocator.destroy(cow);
         cow.* = false;
-        return .{ .data = data, .base_data = data, .shape = shape, .allocator = allocator, .refcount = refcount, .cow = cow, .huge_allocator_owner = null };
+        return .{ .data = data, .base_data = data, .shape = shape, .allocator = allocator, .refcount = refcount, .cow = cow, .huge_allocator_owner = null, .rsf = null };
     }
 
     fn initHugeUninitialized(parent_allocator: Allocator, dims: []const usize) !Tensor {
@@ -1337,6 +1338,7 @@ pub const Tensor = struct {
             .refcount = refcount,
             .cow = cow,
             .huge_allocator_owner = owner,
+            .rsf = null,
         };
     }
 
@@ -1485,7 +1487,145 @@ pub const Tensor = struct {
                 _ = iterator.advance();
             }
         }
+        result.rsf = self.rsf;
         return result;
+    }
+
+    pub fn initBound(allocator: Allocator, dims: []const usize, rsf_binding: types.RSFBinding) !Tensor {
+        if (rsf_binding.dim == 0) return Error.InvalidDimension;
+        if (dims.len == 0 or dims.len > 8) return Error.InvalidShape;
+        var tensor = try Tensor.init(allocator, dims);
+        errdefer tensor.deinit();
+        const expected = switch (rsf_binding.space) {
+            .latent_state => blk: {
+                if (dims.len != 3 or dims[1] != rsf_binding.dim or dims[2] != 2) return Error.ShapeMismatch;
+                break :blk dims[0] * rsf_binding.dim * 2;
+            },
+            .index_payload => blk: {
+                if (dims.len != 1 or dims[0] != rsf_binding.dim * 2) return Error.ShapeMismatch;
+                break :blk rsf_binding.dim * 2;
+            },
+            .fisher_block => blk: {
+                if (dims.len != 2 or dims[0] != rsf_binding.dim or dims[1] != 3) return Error.ShapeMismatch;
+                break :blk rsf_binding.dim * 3;
+            },
+            else => blk: {
+                if (dims.len != 2 or dims[0] != rsf_binding.dim or dims[1] != rsf_binding.space.columns()) return Error.ShapeMismatch;
+                break :blk rsf_binding.dim * rsf_binding.space.columns();
+            },
+        };
+        if (tensor.data.len != expected) return Error.DataLengthMismatch;
+        tensor.rsf = rsf_binding;
+        return tensor;
+    }
+
+    pub fn initCoupling(allocator: Allocator, rsf_binding: types.RSFBinding) !Tensor {
+        switch (rsf_binding.space) {
+            .layer_weight_s, .layer_weight_t, .gradient, .fisher, .momentum, .master_weight, .ranker_head => {},
+            else => return Error.RSFSpaceMismatch,
+        }
+        return Tensor.initBound(allocator, &.{ rsf_binding.dim, 2 }, rsf_binding);
+    }
+
+    pub fn initFisherBlocks(allocator: Allocator, rsf_binding: types.RSFBinding) !Tensor {
+        if (rsf_binding.space != .fisher_block) return Error.RSFSpaceMismatch;
+        return Tensor.initBound(allocator, &.{ rsf_binding.dim, 3 }, rsf_binding);
+    }
+
+    pub fn initLatent(allocator: Allocator, model_id: u64, dim: usize, batch: usize) !Tensor {
+        if (model_id == 0 or dim == 0 or batch == 0) return Error.InvalidDimension;
+        return Tensor.initBound(allocator, &.{ batch, dim, 2 }, types.RSFBinding.model(.latent_state, model_id, dim));
+    }
+
+    pub fn initIndexPayload(allocator: Allocator, model_id: u64, dim: usize) !Tensor {
+        if (model_id == 0 or dim == 0) return Error.InvalidDimension;
+        return Tensor.initBound(allocator, &.{ dim * 2 }, types.RSFBinding.model(.index_payload, model_id, dim));
+    }
+
+    pub fn binding(self: *const Tensor) ?types.RSFBinding {
+        return self.rsf;
+    }
+
+    pub fn requireSpace(self: *const Tensor, space: types.RSFSpace) types.RSFBindingError!types.RSFBinding {
+        const bound = self.rsf orelse return types.RSFBindingError.RSFBindingRequired;
+        if (bound.space != space) return types.RSFBindingError.RSFSpaceMismatch;
+        return bound;
+    }
+
+    pub fn requireCouplingCompatible(self: *const Tensor, other: *const Tensor) types.RSFBindingError!void {
+        const a = self.rsf orelse return types.RSFBindingError.RSFBindingRequired;
+        const b = other.rsf orelse return types.RSFBindingError.RSFBindingRequired;
+        if (a.model_id != b.model_id or (a.model_id == 0 and b.model_id != 0)) return types.RSFBindingError.RSFModelMismatch;
+        if (a.dim != b.dim) return types.RSFBindingError.RSFDimMismatch;
+        const a_ok = a.space == .layer_weight_s or a.space == .layer_weight_t or a.space == .gradient or a.space == .master_weight or a.space == .ranker_head;
+        const b_ok = b.space == .layer_weight_s or b.space == .layer_weight_t or b.space == .gradient or b.space == .master_weight or b.space == .ranker_head;
+        if (!a_ok or !b_ok) return types.RSFBindingError.RSFSpaceMismatch;
+        if (a.layer_index != null and b.layer_index != null and a.layer_index.? != b.layer_index.?) return types.RSFBindingError.RSFLayerMismatch;
+    }
+
+    pub fn clone(self: *const Tensor, allocator: Allocator) !Tensor {
+        return self.copy(allocator);
+    }
+
+    pub fn copyFrom(self: *Tensor, source: *const Tensor) !void {
+        if (!self.shape.equals(&source.shape)) return Error.ShapeMismatch;
+        if (self.rsf) |mine| {
+            const theirs = source.rsf orelse return Error.RSFBindingRequired;
+            if (!mine.eql(theirs)) return Error.RSFModelMismatch;
+        } else if (source.rsf != null) {
+            return Error.RSFBindingRequired;
+        }
+        try self.ensureWritable();
+        if (self.shape.isContiguous() and source.shape.isContiguous()) {
+            @memcpy(self.data, source.data);
+        } else {
+            var dst = TensorIterator.init(&self.shape);
+            var src = TensorIterator.init(&source.shape);
+            var i: usize = 0;
+            while (i < self.shape.totalSize()) : (i += 1) {
+                self.data[dst.offset] = source.data[src.offset];
+                _ = dst.advance();
+                _ = src.advance();
+            }
+        }
+    }
+
+    pub fn evenHalf(self: *Tensor) ![]f32 {
+        if (self.shape.dims.len != 2 or self.shape.dims[1] % 2 != 0 or !self.shape.isContiguous()) return Error.ShapeMismatch;
+        return self.data[0 .. self.shape.dims[1] / 2];
+    }
+
+    pub fn oddHalf(self: *Tensor) ![]f32 {
+        if (self.shape.dims.len != 2 or self.shape.dims[1] % 2 != 0 or !self.shape.isContiguous()) return Error.ShapeMismatch;
+        return self.data[self.shape.dims[1] / 2 .. self.shape.dims[1]];
+    }
+
+    pub const RowHalves = struct { x1: []f32, x2: []f32 };
+
+    pub fn rowHalves(self: *Tensor, row: usize) !RowHalves {
+        if (self.shape.dims.len != 2 or self.shape.dims[1] % 2 != 0 or !self.shape.isContiguous()) return Error.ShapeMismatch;
+        if (row >= self.shape.dims[0]) return Error.OutOfBounds;
+        const width = self.shape.dims[1] / 2;
+        const base = row * self.shape.dims[1];
+        return .{ .x1 = self.data[base .. base + width], .x2 = self.data[base + width .. base + 2 * width] };
+    }
+
+    pub fn toFP16(src: *const Tensor, dst: []f16) !void {
+        if (dst.len < src.data.len) return Error.DataLengthMismatch;
+        for (src.data, 0..) |value, i| {
+            if (!math.isFinite(value)) return Error.NonFinite;
+            dst[i] = @floatCast(math.clamp(value, @as(f32, -65504.0), @as(f32, 65504.0)));
+        }
+    }
+
+    pub fn fromFP16(src: []const f16, dst: *Tensor) !void {
+        if (src.len < dst.data.len) return Error.DataLengthMismatch;
+        try dst.ensureWritable();
+        for (dst.data, 0..) |*value, i| {
+            const converted: f32 = @floatCast(src[i]);
+            if (!math.isFinite(converted)) return Error.NonFinite;
+            value.* = converted;
+        }
     }
 
     pub fn get(self: *const Tensor, indices: []const usize) !f32 {
@@ -1814,13 +1954,13 @@ pub const Tensor = struct {
         errdefer new_shape.deinit(self.allocator);
         if (new_shape.totalSize() != self.shape.totalSize()) return Error.InvalidShape;
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner, .rsf = self.rsf };
     }
 
     pub fn newView(self: *Tensor, shape: Shape) !Tensor {
         if (shape.totalSize() != self.shape.totalSize()) return Error.InvalidShape;
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner, .rsf = self.rsf };
     }
 
     pub fn slice(self: *Tensor, starts: []const usize, ends: []const usize) !Tensor {
@@ -1862,7 +2002,7 @@ pub const Tensor = struct {
         var new_shape = try Shape.initWithStrides(self.allocator, dims_stack[0..axes.len], strides_stack[0..axes.len]);
         errdefer new_shape.deinit(self.allocator);
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner, .rsf = self.rsf };
     }
 
     pub fn broadcast(self: *Tensor, target_dims: []const usize) !Tensor {
@@ -1884,7 +2024,7 @@ pub const Tensor = struct {
         var new_shape = try Shape.initWithStrides(self.allocator, target_dims, strides_stack[0..target_dims.len]);
         errdefer new_shape.deinit(self.allocator);
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner, .rsf = self.rsf };
     }
 
     pub fn unsqueeze(self: *Tensor, axis: usize) !Tensor {
@@ -1906,7 +2046,7 @@ pub const Tensor = struct {
         var new_shape = try Shape.initWithStrides(self.allocator, dims_stack[0 .. self.shape.dims.len + 1], strides_stack[0 .. self.shape.dims.len + 1]);
         errdefer new_shape.deinit(self.allocator);
         self.retain();
-        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner };
+        return .{ .data = self.data, .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow, .huge_allocator_owner = self.huge_allocator_owner, .rsf = self.rsf };
     }
 
     pub fn zeros(allocator: Allocator, dims: []const usize) !Tensor {
@@ -3136,6 +3276,7 @@ pub fn gramRank2(w: []const f32, dim: usize) Error!Rank2Gram {
     while (d < dim) : (d += 1) {
         const w0: f64 = @floatCast(w[d * coupling_width + coupling_weight_column]);
         const w1: f64 = @floatCast(w[d * coupling_width + coupling_bias_column]);
+        if (!std.math.isFinite(w0) or !std.math.isFinite(w1)) return Error.NonFinite;
         a += w0 * w0;
         b += w0 * w1;
         c += w1 * w1;
@@ -3173,9 +3314,47 @@ pub fn normalizeRank2Stack(stack: []f32, layers: usize, dim: usize, target: f64,
     }
 }
 
-pub fn constrainCouplingSpectralNorm(w: []f32, dim: usize, target: f32) Error!f64 {
+pub fn constrainCouplingSpectralNormRaw(w: []f32, dim: usize, target: f32) Error!f64 {
     if (!std.math.isFinite(target) or !(target > 0.0)) return Error.InvalidArgument;
     return normalizeRank2(w, dim, @as(f64, @floatCast(target)));
+}
+
+pub fn couplingSpectralNorm(weight: *const Tensor) Error!f32 {
+    const bound = weight.rsf orelse return Error.RSFBindingRequired;
+    switch (bound.space) {
+        .layer_weight_s, .layer_weight_t, .gradient, .master_weight, .ranker_head => {},
+        else => return Error.RSFSpaceMismatch,
+    }
+    if (weight.shape.dims.len != 2 or weight.shape.dims[1] != 2) return Error.ShapeMismatch;
+    const sigma = try exactSpectralNormRank2(weight.data, weight.shape.dims[0]);
+    return @floatCast(sigma);
+}
+
+pub fn constrainCouplingSpectralNorm(weight: *Tensor, target: f32) Error!f32 {
+    if (!std.math.isFinite(target) or target <= 0.0) return Error.InvalidArgument;
+    const bound = weight.rsf orelse return Error.RSFBindingRequired;
+    switch (bound.space) {
+        .layer_weight_s, .layer_weight_t, .gradient, .master_weight, .ranker_head => {},
+        else => return Error.RSFSpaceMismatch,
+    }
+    if (weight.shape.dims.len != 2 or weight.shape.dims[1] != 2) return Error.ShapeMismatch;
+    const sigma = try exactSpectralNormRank2(weight.data, weight.shape.dims[0]);
+    if (sigma > @as(f64, target)) {
+        try weight.ensureWritable();
+        const factor: f32 = @floatCast(@as(f64, target) / sigma);
+        for (weight.data) |*value| value.* *= factor;
+    }
+    return @floatCast(sigma);
+}
+
+pub fn constrainCouplingStackSpectralNorm(weights: []Tensor, target: f32) Error!usize {
+    var changed: usize = 0;
+    for (weights) |*weight| {
+        const before = try couplingSpectralNorm(weight);
+        _ = try constrainCouplingSpectralNorm(weight, target);
+        if (before > @as(f64, target)) changed += 1;
+    }
+    return changed;
 }
 
 pub fn hadamardBlockInPlace(block: []f32) Error!void {
@@ -3359,7 +3538,10 @@ pub fn globalDiffuseRowUnchecked(row: []f32, layout: types.RSFDiffusionLayout) v
             }
         }
     }
-    if (layout.radix <= 1) return;
+    if (layout.radix == 1) {
+        for (row) |*value| value.* = -value.*;
+        return;
+    }
     const m = layout.block;
     const r = layout.radix;
     const factor: f32 = @floatCast(2.0 / @as(f64, @floatFromInt(r)));
@@ -3383,6 +3565,73 @@ pub fn globalDiffuseRowUnchecked(row: []f32, layout: types.RSFDiffusionLayout) v
         }
         o += width;
     }
+}
+
+pub fn mixRadixBlocksInPlace(data: []f32, layout: types.RSFDiffusionLayout) Error!void {
+    if (!diffusionLayoutIsApplicable(data.len, layout)) return Error.InvalidDiffusionLayout;
+    if (layout.radix == 1) {
+        for (data) |*value| value.* = -value.*;
+        return;
+    }
+    var tile: [diffusion_tile]f32 = undefined;
+    var offset: usize = 0;
+    while (offset < layout.block) {
+        const width = @min(diffusion_tile, layout.block - offset);
+        for (tile[0..width]) |*value| value.* = 0.0;
+        var block_index: usize = 0;
+        while (block_index < layout.radix) : (block_index += 1) {
+            const base = block_index * layout.block + offset;
+            for (0..width) |j| tile[j] += data[base + j];
+        }
+        const factor: f32 = @floatCast(2.0 / @as(f64, @floatFromInt(layout.radix)));
+        block_index = 0;
+        while (block_index < layout.radix) : (block_index += 1) {
+            const base = block_index * layout.block + offset;
+            for (0..width) |j| data[base + j] -= factor * tile[j];
+        }
+        offset += width;
+    }
+}
+
+pub fn walshHadamardInPlace(data: []f32) Error!void {
+    if (data.len == 0 or (data.len & (data.len - 1)) != 0) return Error.InvalidDimension;
+    try hadamardBlockInPlace(data);
+}
+
+pub fn diffuseRowInPlace(row: []f32, layout: types.RSFDiffusionLayout) Error!void {
+    if (!diffusionLayoutIsApplicable(row.len, layout)) return Error.InvalidDiffusionLayout;
+    var block: usize = 0;
+    while (block < layout.radix) : (block += 1) {
+        const base = block * layout.block;
+        try walshHadamardInPlace(row[base .. base + layout.block]);
+    }
+    try mixRadixBlocksInPlace(row, layout);
+}
+
+pub fn diffuseBatchInPlace(state: *Tensor, layout: types.RSFDiffusionLayout) Error!void {
+    if (state.rsf == null or state.rsf.?.space != .latent_state) return Error.RSFBindingRequired;
+    if (state.shape.dims.len != 3 or state.shape.dims[1] != layout.row_len / 2 or state.shape.dims[2] != 2) return Error.ShapeMismatch;
+    const rows = state.shape.dims[0];
+    const row = try state.allocator.alloc(f32, layout.row_len);
+    defer state.allocator.free(row);
+    for (0..rows) |r| {
+        const base = r * layout.row_len;
+        for (0..layout.row_len / 2) |d| {
+            row[d] = state.data[base + d * 2];
+            row[layout.row_len / 2 + d] = state.data[base + d * 2 + 1];
+        }
+        try diffuseRowInPlace(row, layout);
+        for (0..layout.row_len / 2) |d| {
+            state.data[base + d * 2] = row[d];
+            state.data[base + d * 2 + 1] = row[layout.row_len / 2 + d];
+        }
+    }
+}
+
+pub fn diffusionLayoutFor(dim: usize) Error!types.RSFDiffusionLayout {
+    if (dim == 0) return Error.InvalidDimension;
+    const row_len = std.math.mul(usize, dim, 2) catch return Error.Overflow;
+    return types.rsfDiffusionLayout(row_len) orelse Error.InvalidDiffusionLayout;
 }
 
 pub fn globalDiffuseRowStack(row: []f32, layout: types.RSFDiffusionLayout) Error!void {
@@ -3412,25 +3661,26 @@ pub const CausalKeyAccumulator = struct {
     }
 };
 
-pub fn causalKeyReset(mask: types.RSFSequenceMask, key_out: []f32) void {
-    if (mask.full_causal) return;
+pub fn causalKeyReset(_: types.RSFSequenceMask, key_out: []f32) void {
     @memset(key_out, 0.0);
 }
 
 pub fn causalKeyAccumulate(mask: types.RSFSequenceMask, x2_in: []const f32, t: usize, key_out: []f32) void {
     const dim = key_out.len;
     causalKeyReset(mask, key_out);
-    if (!mask.full_causal) {
+    if (mask.full_causal) {
+        var j: usize = 0;
+        while (j < t) : (j += 1) {
+            for (0..dim) |d| key_out[d] += x2_in[j * dim + d];
+        }
+    } else {
         var accumulator = CausalKeyAccumulator{ .src = x2_in, .dst = key_out, .row_len = dim };
         mask.rowSetBits(t, &accumulator, CausalKeyAccumulator.add);
     }
-    const base = t * dim;
-    var d: usize = 0;
-    while (d < dim) : (d += 1) key_out[d] += x2_in[base + d];
 }
 
 pub fn causalCouplingKeyCount(mask: types.RSFSequenceMask, t: usize) usize {
-    return mask.rowNnz(t) + 1;
+    return mask.rowNnz(t);
 }
 
 pub fn causalCouplingForward(
@@ -3457,6 +3707,7 @@ pub fn causalCouplingForward(
     @memset(k, 0.0);
     var logdet: f64 = 0.0;
     var t: usize = 0;
+    @memset(k, 0.0);
     while (t < seq_len) : (t += 1) {
         const base = t * dim;
         causalKeyAccumulate(mask, x2, t, k);
@@ -3475,6 +3726,7 @@ pub fn causalCouplingForward(
             trans[d] = shift;
             y2[base + d] = x2[base + d] + shift;
         }
+
     }
     return logdet;
 }
@@ -3520,6 +3772,7 @@ pub fn causalCouplingInverse(
             scale[d] = factor;
             x1[base + d] = y1[base + d] / factor;
         }
+
     }
     return logdet;
 }
@@ -3603,6 +3856,286 @@ pub fn causalCouplingBackward(
         }
     }
     return logdet;
+}
+
+pub fn causalPrefixSum(mask: *const types.RSFSequenceMask, x2: []const f32, dim: usize, out_K: []f32) Error!void {
+    if (dim == 0) return Error.DimensionMismatch;
+    if (mask.seq_len == 0) return Error.InvalidCausalMask;
+    const total = std.math.mul(usize, mask.seq_len, dim) catch return Error.Overflow;
+    if (x2.len < total or out_K.len < total) return Error.DataLengthMismatch;
+    if (mask.full_causal) {
+        const running = out_K[(mask.seq_len - 1) * dim ..][0..dim];
+        @memset(running, 0.0);
+        for (0..mask.seq_len) |t| {
+            const row = out_K[t * dim ..][0..dim];
+            if (t + 1 < mask.seq_len) {
+                @memcpy(row, running);
+                for (0..dim) |d| running[d] += x2[t * dim + d];
+            }
+        }
+        return;
+    }
+    for (0..mask.seq_len) |t| {
+        const row = out_K[t * dim ..][0..dim];
+        @memset(row, 0.0);
+        const Acc = struct {
+            src: []const f32,
+            dst: []f32,
+            width: usize,
+            fn visit(self: *@This(), j: usize) void {
+                for (0..self.width) |d| self.dst[d] += self.src[j * self.width + d];
+            }
+        };
+        var ctx = Acc{ .src = x2, .dst = row, .width = dim };
+        mask.rowSetBits(t, &ctx, Acc.visit);
+    }
+}
+
+
+fn validateLatentBatchBinding(state: *const Tensor, dim: usize, required_space: types.RSFSpace) !void {
+    if (state.shape.dims.len != 3 or state.shape.dims[1] != dim or state.shape.dims[2] != 2) return Error.ShapeMismatch;
+    const bound = state.rsf orelse return Error.RSFBindingRequired;
+    if (bound.space != required_space) return Error.RSFSpaceMismatch;
+    if (bound.model_id == 0 or bound.dim != dim) return Error.RSFModelMismatch;
+}
+
+fn validateCouplingTensor(weight: *const Tensor, dim: usize, space: types.RSFSpace) !types.RSFBinding {
+    const bound = weight.rsf orelse return Error.RSFBindingRequired;
+    if (bound.space != space) return Error.RSFSpaceMismatch;
+    if (weight.shape.dims.len != 2 or weight.shape.dims[0] != dim or weight.shape.dims[1] != 2) return Error.ShapeMismatch;
+    if (weight.data.len != dim * 2) return Error.DataLengthMismatch;
+    return bound;
+}
+
+fn sequenceParams(state: *const Tensor, s_weight: *const Tensor, t_weight: *const Tensor, dim: usize, clip_min: f32, clip_max: f32) !RSFCouplingParams {
+    try validateLatentBatchBinding(state, dim, .latent_state);
+    const sb = try validateCouplingTensor(s_weight, dim, .layer_weight_s);
+    const tb = try validateCouplingTensor(t_weight, dim, .layer_weight_t);
+    const state_binding = state.rsf.?;
+    if (sb.model_id != state_binding.model_id or tb.model_id != state_binding.model_id) return Error.RSFModelMismatch;
+    if (sb.dim != dim or tb.dim != dim) return Error.RSFDimMismatch;
+    if (sb.layer_index != tb.layer_index) return Error.RSFLayerMismatch;
+    return try RSFCouplingParams.init(s_weight.data, t_weight.data, dim, clip_min, clip_max);
+}
+
+pub fn causalCouplingForwardBatch(state: *Tensor, mask: *const types.RSFSequenceMask, s_weight: *const Tensor, t_weight: *const Tensor, clip_min: f32, clip_max: f32, scratch_K: []f32) Error!f32 {
+    if (s_weight.shape.dims.len != 2) return Error.ShapeMismatch;
+    const dim = s_weight.shape.dims[0];
+    if (mask.seq_len == 0) return Error.InvalidCausalMask;
+    const params = try sequenceParams(state, s_weight, t_weight, dim, clip_min, clip_max);
+    const token_count = state.shape.dims[0];
+    if (token_count == 0 or token_count % mask.seq_len != 0) return Error.DimensionMismatch;
+    const sequence_size = std.math.mul(usize, mask.seq_len, dim) catch return Error.Overflow;
+    if (scratch_K.len < sequence_size) return Error.DataLengthMismatch;
+    try state.ensureWritable();
+    const row_width = std.math.mul(usize, dim, 2) catch return Error.Overflow;
+    var total_logdet: f64 = 0.0;
+    for (0..token_count / mask.seq_len) |sequence| {
+        const offset = sequence * mask.seq_len * row_width;
+        for (0..mask.seq_len) |t| for (0..dim) |d| {
+            const index = offset + t * row_width + d * 2;
+            scratch_K[t * dim + d] = state.data[index + 1];
+        };
+        for (0..mask.seq_len) |t| {
+            const row = offset + t * row_width;
+            for (0..dim) |d| {
+                var key: f32 = 0.0;
+                if (mask.full_causal) {
+                    for (0..t) |j| key += scratch_K[j * dim + d];
+                } else {
+                    for (0..mask.seq_len) |j| {
+                        if (mask.get(t, j)) key += scratch_K[j * dim + d];
+                    }
+                }
+                const raw = params.scaleWeight(d) * key + params.scaleBias(d);
+                const clipped = clipCoupling(raw, clip_min, clip_max);
+                total_logdet += clipped;
+                const x1 = state.data[row + d * 2];
+                const x2 = scratch_K[t * dim + d];
+                const y1 = x1 * @exp(clipped);
+                const shift = params.translationWeight(d) * y1 + params.translationBias(d);
+                state.data[row + d * 2] = y1;
+                state.data[row + d * 2 + 1] = x2 + shift;
+            }
+        }
+    }
+    return @floatCast(total_logdet);
+}
+
+pub fn causalCouplingInverseBatch(state: *Tensor, mask: *const types.RSFSequenceMask, s_weight: *const Tensor, t_weight: *const Tensor, clip_min: f32, clip_max: f32, scratch_K: []f32, scratch_X2: []f32) Error!void {
+    if (s_weight.shape.dims.len != 2) return Error.ShapeMismatch;
+    const dim = s_weight.shape.dims[0];
+    if (mask.seq_len == 0) return Error.InvalidCausalMask;
+    const params = try sequenceParams(state, s_weight, t_weight, dim, clip_min, clip_max);
+    if (state.shape.dims[0] == 0 or state.shape.dims[0] % mask.seq_len != 0) return Error.DimensionMismatch;
+    const sequence_size = std.math.mul(usize, mask.seq_len, dim) catch return Error.Overflow;
+    if (scratch_K.len < sequence_size or scratch_X2.len < sequence_size) return Error.DataLengthMismatch;
+    try state.ensureWritable();
+    const row_width = std.math.mul(usize, dim, 2) catch return Error.Overflow;
+    for (0..state.shape.dims[0] / mask.seq_len) |sequence| {
+        const offset = sequence * mask.seq_len * row_width;
+        for (0..mask.seq_len) |t| for (0..dim) |d| {
+            const index = offset + t * row_width + d * 2;
+            scratch_X2[t * dim + d] = state.data[index + 1] - params.translationWeight(d) * state.data[index] - params.translationBias(d);
+        };
+        try causalPrefixSum(mask, scratch_X2[0..sequence_size], dim, scratch_K[0..sequence_size]);
+        for (0..mask.seq_len) |t| for (0..dim) |d| {
+            const index = offset + t * row_width + d * 2;
+            const raw = params.scaleWeight(d) * scratch_K[t * dim + d] + params.scaleBias(d);
+            const clipped = clipCoupling(raw, clip_min, clip_max);
+            state.data[index] = state.data[index] * @exp(-clipped);
+            state.data[index + 1] = scratch_X2[t * dim + d];
+        };
+    }
+}
+
+pub const CausalAdjointScratch = struct {
+    key: []f32,
+    ds: []f32,
+    x2: []f32,
+    y1: []f32,
+    g_y1: []f32,
+    g_y2: []f32,
+    dx1: []f32,
+    dx2: []f32,
+    ds_weight: []f32,
+    dt_weight: []f32,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, seq_len: usize, dim: usize) !CausalAdjointScratch {
+        if (seq_len == 0 or dim == 0) return Error.InvalidDimension;
+        const sequence_size = std.math.mul(usize, seq_len, dim) catch return Error.Overflow;
+        const pair_size = std.math.mul(usize, dim, coupling_width) catch return Error.Overflow;
+        const key = try allocator.alloc(f32, dim);
+        errdefer allocator.free(key);
+        const ds = try allocator.alloc(f32, sequence_size);
+        errdefer allocator.free(ds);
+        const x2 = try allocator.alloc(f32, sequence_size);
+        errdefer allocator.free(x2);
+        const y1 = try allocator.alloc(f32, sequence_size);
+        errdefer allocator.free(y1);
+        const g_y1 = try allocator.alloc(f32, sequence_size);
+        errdefer allocator.free(g_y1);
+        const g_y2 = try allocator.alloc(f32, sequence_size);
+        errdefer allocator.free(g_y2);
+        const dx1 = try allocator.alloc(f32, sequence_size);
+        errdefer allocator.free(dx1);
+        const dx2 = try allocator.alloc(f32, sequence_size);
+        errdefer allocator.free(dx2);
+        const ds_weight = try allocator.alloc(f32, pair_size);
+        errdefer allocator.free(ds_weight);
+        const dt_weight = try allocator.alloc(f32, pair_size);
+        errdefer allocator.free(dt_weight);
+        return .{
+            .key = key,
+            .ds = ds,
+            .x2 = x2,
+            .y1 = y1,
+            .g_y1 = g_y1,
+            .g_y2 = g_y2,
+            .dx1 = dx1,
+            .dx2 = dx2,
+            .ds_weight = ds_weight,
+            .dt_weight = dt_weight,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *CausalAdjointScratch) void {
+        self.allocator.free(self.key);
+        self.allocator.free(self.ds);
+        self.allocator.free(self.x2);
+        self.allocator.free(self.y1);
+        self.allocator.free(self.g_y1);
+        self.allocator.free(self.g_y2);
+        self.allocator.free(self.dx1);
+        self.allocator.free(self.dx2);
+        self.allocator.free(self.ds_weight);
+        self.allocator.free(self.dt_weight);
+        self.* = undefined;
+    }
+};
+
+fn validateLatentGradientBinding(gradient: *const Tensor, dim: usize, model_id: u64) !void {
+    try validateLatentBatchBinding(gradient, dim, .latent_state);
+    const binding = gradient.rsf.?;
+    if (binding.model_id != model_id or binding.dim != dim) return Error.RSFModelMismatch;
+}
+
+pub fn causalCouplingBackwardBatch(
+    state_in: *const Tensor,
+    state_out: *const Tensor,
+    grad_out: *const Tensor,
+    grad_in: *Tensor,
+    mask: *const types.RSFSequenceMask,
+    s_weight: *const Tensor,
+    t_weight: *const Tensor,
+    s_grad: *Tensor,
+    t_grad: *Tensor,
+    clip_min: f32,
+    clip_max: f32,
+    volume_term: f32,
+    scratch: *CausalAdjointScratch,
+) Error!f32 {
+    if (s_weight.shape.dims.len != 2) return Error.ShapeMismatch;
+    const dim = s_weight.shape.dims[0];
+    if (mask.seq_len == 0) return Error.InvalidCausalMask;
+    const params = try sequenceParams(state_in, s_weight, t_weight, dim, clip_min, clip_max);
+    const state_binding = state_in.rsf.?;
+    try validateLatentGradientBinding(state_out, dim, state_binding.model_id);
+    try validateLatentGradientBinding(grad_out, dim, state_binding.model_id);
+    try validateLatentGradientBinding(grad_in, dim, state_binding.model_id);
+    const sb = try validateCouplingTensor(s_grad, dim, .gradient);
+    const tb = try validateCouplingTensor(t_grad, dim, .gradient);
+    if (sb.model_id != state_binding.model_id or tb.model_id != state_binding.model_id) return Error.RSFModelMismatch;
+    if (sb.layer_index != tb.layer_index) return Error.RSFLayerMismatch;
+    const token_count = state_in.shape.dims[0];
+    if (token_count == 0 or token_count % mask.seq_len != 0) return Error.DimensionMismatch;
+    const sequence_size = std.math.mul(usize, mask.seq_len, dim) catch return Error.Overflow;
+    if (scratch.x2.len < sequence_size or scratch.y1.len < sequence_size or scratch.g_y1.len < sequence_size or scratch.g_y2.len < sequence_size or scratch.dx1.len < sequence_size or scratch.dx2.len < sequence_size or scratch.ds.len < sequence_size) return Error.DataLengthMismatch;
+    if (scratch.key.len < dim or scratch.ds_weight.len < dim * coupling_width or scratch.dt_weight.len < dim * coupling_width) return Error.DataLengthMismatch;
+    try s_grad.ensureWritable();
+    try t_grad.ensureWritable();
+    try grad_in.ensureWritable();
+    @memset(s_grad.data, 0.0);
+    @memset(t_grad.data, 0.0);
+    var total_logdet: f64 = 0.0;
+    const row_width = dim * 2;
+    for (0..token_count / mask.seq_len) |sequence| {
+        const offset = sequence * mask.seq_len * row_width;
+        for (0..mask.seq_len) |t| for (0..dim) |d| {
+            const index = offset + t * row_width + d * 2;
+            scratch.x2[t * dim + d] = state_in.data[index + 1];
+            scratch.y1[t * dim + d] = state_out.data[index];
+            scratch.g_y1[t * dim + d] = grad_out.data[index];
+            scratch.g_y2[t * dim + d] = grad_out.data[index + 1];
+        };
+        @memset(scratch.ds_weight, 0.0);
+        @memset(scratch.dt_weight, 0.0);
+        total_logdet += try causalCouplingBackward(
+            params,
+            mask.*,
+            scratch.x2[0..sequence_size],
+            scratch.y1[0..sequence_size],
+            scratch.g_y1[0..sequence_size],
+            scratch.g_y2[0..sequence_size],
+            volume_term,
+            scratch.ds_weight,
+            scratch.dt_weight,
+            scratch.dx1[0..sequence_size],
+            scratch.dx2[0..sequence_size],
+            scratch.key[0..dim],
+            scratch.ds[0..sequence_size],
+        );
+        for (s_grad.data, 0..) |*value, i| value.* += scratch.ds_weight[i];
+        for (t_grad.data, 0..) |*value, i| value.* += scratch.dt_weight[i];
+        for (0..mask.seq_len) |t| for (0..dim) |d| {
+            const index = offset + t * row_width + d * 2;
+            grad_in.data[index] = scratch.dx1[t * dim + d];
+            grad_in.data[index + 1] = scratch.dx2[t * dim + d];
+        };
+    }
+    return @floatCast(total_logdet);
 }
 
 fn slicesOverlap(a: []const f32, b: []const f32) bool {

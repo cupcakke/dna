@@ -598,6 +598,14 @@ pub const Error = error{
     RSFDimMismatch,
     InvalidCausalMask,
     InvalidDiffusionLayout,
+    InvalidDimension,
+    DimensionMismatch,
+    DataLengthMismatch,
+    InvalidDataLength,
+    NonFinite,
+    InvalidParameter,
+    InvalidConfig,
+    OutOfMemory,
 };
 
 pub fn clamp(comptime T: type, value: T, min_val: T, max_val: T) T {
@@ -1681,6 +1689,8 @@ pub const RSFBindingError = error{
     RSFModelMismatch,
     RSFLayerMismatch,
     RSFDimMismatch,
+    InvalidCausalMask,
+    InvalidDiffusionLayout,
 };
 
 pub const RSFBinding = struct {

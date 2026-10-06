@@ -70,6 +70,18 @@ pub fn blockInverseSqrt(A: f64, B: f64, C: f64, lambda: f64) BlockInv {
     };
 }
 
+pub fn blockInverseFisher(A: f64, B: f64, C: f64, lambda: f64) BlockInv {
+    const Ad = A + lambda;
+    const Cd = C + lambda;
+    const det_raw = Ad * Cd - B * B;
+    const det = if (det_raw > MIN_DET) det_raw else MIN_DET;
+    return .{
+        .inv00 = Cd / det,
+        .inv01 = -B / det,
+        .inv11 = Ad / det,
+    };
+}
+
 fn validateConfig(cfg: SFDConfig) !void {
     if (!std.math.isFinite(cfg.beta1) or cfg.beta1 < 0.0 or cfg.beta1 >= 1.0) return error.InvalidBeta1;
     if (!std.math.isFinite(cfg.fisher_gamma) or cfg.fisher_gamma < 0.0 or cfg.fisher_gamma >= 1.0) return error.InvalidFisherGamma;
@@ -154,47 +166,26 @@ fn applyBlockVec(inv: BlockInv, x0: f64, x1: f64) struct { y0: f64, y1: f64 } {
 }
 
 pub const SpectralNormalizerConfig = struct {
-    power_iterations: usize = 5,
-    eps: f32 = 1e-12,
     max_singular_value: f32 = 1.0,
 };
 
 pub const SpectralNormalizer = struct {
-    power_iterations: usize,
-    eps: f32,
     max_singular_value: f32,
 
-    pub fn init(power_iterations: usize) SpectralNormalizer {
-        return .{
-            .power_iterations = power_iterations,
-            .eps = 1e-12,
-            .max_singular_value = 1.0,
-        };
+    pub fn init() SpectralNormalizer {
+        return .{ .max_singular_value = 1.0 };
     }
 
     pub fn initWithConfig(config: SpectralNormalizerConfig) SpectralNormalizer {
-        return .{
-            .power_iterations = config.power_iterations,
-            .eps = config.eps,
-            .max_singular_value = config.max_singular_value,
-        };
+        return .{ .max_singular_value = config.max_singular_value };
     }
 
     pub fn normalizeWeights(self: *SpectralNormalizer, weights: *Tensor, allocator: Allocator) !void {
-        if (weights.shape.dims.len != 2) return error.InvalidShape;
-        const rows = weights.shape.dims[0];
-        const cols = weights.shape.dims[1];
-        if (rows == 0 or cols == 0) return error.InvalidShape;
-        if (cols == coupling_width) {
-            const sigma = try tensor_mod.constrainCouplingSpectralNorm(weights.data, rows, self.max_singular_value);
-            _ = sigma;
-            return;
-        }
-        const sigma = try denseSpectralNorm(weights.data, rows, cols, self.power_iterations, self.eps, allocator);
-        if (!std.math.isFinite(sigma)) return error.NonFinite;
-        if (sigma > self.max_singular_value and sigma > 0.0) {
-            try weights.mulScalar(self.max_singular_value / sigma);
-        }
+        _ = allocator;
+        if (weights.shape.dims.len != 2 or weights.shape.dims[1] != coupling_width) return error.InvalidShape;
+        if (weights.shape.dims[0] == 0) return error.InvalidShape;
+        if (!std.math.isFinite(self.max_singular_value) or self.max_singular_value <= 0.0) return error.InvalidSpectralTarget;
+        _ = try tensor_mod.constrainCouplingSpectralNorm(weights, self.max_singular_value);
     }
 
     pub fn lipschitzRegularization(_: *const SpectralNormalizer, loss: f32, spectral_norms: []const f32, lambda: f32) f32 {
@@ -206,65 +197,6 @@ pub const SpectralNormalizer = struct {
         return loss + lambda * reg_term;
     }
 };
-
-fn denseSpectralNorm(data: []const f32, rows: usize, cols: usize, iterations: usize, eps: f32, allocator: Allocator) !f32 {
-    const n = try checkedMul(rows, cols);
-    if (data.len < n) return error.InvalidShape;
-    const v = try allocator.alloc(f32, cols);
-    defer allocator.free(v);
-    const u = try allocator.alloc(f32, rows);
-    defer allocator.free(u);
-    const inv_sqrt: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(if (cols == 0) 1 else cols)));
-    var j: usize = 0;
-    while (j < cols) : (j += 1) v[j] = inv_sqrt;
-    const iters = if (iterations == 0) @as(usize, 1) else iterations;
-    var iter: usize = 0;
-    while (iter < iters) : (iter += 1) {
-        @memset(u, 0.0);
-        var i: usize = 0;
-        while (i < rows) : (i += 1) {
-            var acc: f64 = 0.0;
-            j = 0;
-            while (j < cols) : (j += 1) acc += @as(f64, data[i * cols + j]) * @as(f64, v[j]);
-            u[i] = @floatCast(acc);
-        }
-        var un: f64 = 0.0;
-        i = 0;
-        while (i < rows) : (i += 1) un += @as(f64, u[i]) * @as(f64, u[i]);
-        un = @sqrt(un);
-        if (un > @as(f64, eps)) {
-            const inv = 1.0 / un;
-            i = 0;
-            while (i < rows) : (i += 1) u[i] = @floatCast(@as(f64, u[i]) * inv);
-        }
-        @memset(v, 0.0);
-        i = 0;
-        while (i < rows) : (i += 1) {
-            j = 0;
-            while (j < cols) : (j += 1) v[j] += u[i] * data[i * cols + j];
-        }
-        var vn: f64 = 0.0;
-        j = 0;
-        while (j < cols) : (j += 1) vn += @as(f64, v[j]) * @as(f64, v[j]);
-        vn = @sqrt(vn);
-        if (vn > @as(f64, eps)) {
-            const inv = 1.0 / vn;
-            j = 0;
-            while (j < cols) : (j += 1) v[j] = @floatCast(@as(f64, v[j]) * inv);
-        }
-    }
-    var sigma: f64 = 0.0;
-    var i: usize = 0;
-    while (i < rows) : (i += 1) {
-        var j2: usize = 0;
-        while (j2 < cols) : (j2 += 1) {
-            sigma += @as(f64, u[i]) * @as(f64, data[i * cols + j2]) * @as(f64, v[j2]);
-        }
-    }
-    const out: f32 = @floatCast(if (sigma >= 0.0) sigma else -sigma);
-    if (!std.math.isFinite(out)) return error.NonFinite;
-    return out;
-}
 
 pub const KFACBlock = struct {
     A_block: Tensor,
@@ -289,9 +221,9 @@ pub const KFACBlock = struct {
         if (dim == 0) return error.InvalidDimension;
         const blen = try blockLen(dim);
         _ = blen;
-        var A = try Tensor.zeros(allocator, &[_]usize{ dim, 3 });
+        var A = try Tensor.initFisherBlocks(allocator, types.RSFBinding.layer(.fisher_block, model.id, layer, dim));
         errdefer A.deinit();
-        var G = try Tensor.zeros(allocator, &[_]usize{ dim, 3 });
+        var G = try Tensor.initFisherBlocks(allocator, types.RSFBinding.layer(.fisher_block, model.id, layer, dim));
         errdefer G.deinit();
         return .{
             .A_block = A,
@@ -445,24 +377,21 @@ pub const SFD = struct {
         defer allocator.free(t_tmp);
         var l: usize = 0;
         while (l < num_layers) : (l += 1) {
-            fisher_s[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 3 });
+            fisher_s[l] = try Tensor.initFisherBlocks(allocator, types.RSFBinding.layer(.fisher_block, model_id, l, dim));
             errdefer fisher_s[l].deinit();
-            fisher_t[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 3 });
+            fisher_t[l] = try Tensor.initFisherBlocks(allocator, types.RSFBinding.layer(.fisher_block, model_id, l, dim));
             errdefer fisher_t[l].deinit();
-            mom_s[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 2 });
+            mom_s[l] = try Tensor.initBound(allocator, &[_]usize{ dim, 2 }, types.RSFBinding.layer(.momentum, model_id, l, dim));
             errdefer mom_s[l].deinit();
-            mom_t[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 2 });
+            mom_t[l] = try Tensor.initBound(allocator, &[_]usize{ dim, 2 }, types.RSFBinding.layer(.momentum, model_id, l, dim));
             errdefer mom_t[l].deinit();
-            master_s[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 2 });
+            master_s[l] = try Tensor.initCoupling(allocator, types.RSFBinding.layer(.master_weight, model_id, l, dim));
             errdefer master_s[l].deinit();
-            master_t[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 2 });
+            master_t[l] = try Tensor.initCoupling(allocator, types.RSFBinding.layer(.master_weight, model_id, l, dim));
             errdefer master_t[l].deinit();
             try model.readLayerWeights(l, s_tmp, t_tmp);
             @memcpy(master_s[l].data[0..plen], s_tmp);
             @memcpy(master_t[l].data[0..plen], t_tmp);
-            _ = types.RSFBinding.layer(.fisher_block, model_id, l, dim);
-            _ = types.RSFBinding.layer(.momentum, model_id, l, dim);
-            _ = types.RSFBinding.layer(.master_weight, model_id, l, dim);
             initialized_layers += 1;
         }
         return .{
@@ -633,7 +562,7 @@ pub const SFD = struct {
                     const Cd = Fhat_bb + lambda;
                     const cond = conditionNumber(Ad, Fhat_wb, Cd);
                     if (cond > cond_max) cond_max = cond;
-                    const inv = blockInverseSqrt(Fhat_ww, Fhat_wb, Fhat_bb, lambda);
+                    const inv = blockInverseFisher(Fhat_ww, Fhat_wb, Fhat_bb, lambda);
                     const mhw: f64 = @as(f64, mw) / @as(f64, m_corr);
                     const mhb: f64 = @as(f64, mb) / @as(f64, m_corr);
                     const ng = applyBlockVec(inv, mhw, mhb);
@@ -663,8 +592,8 @@ pub const SFD = struct {
                     }
                 }
             }
-            const sigma_s = try tensor_mod.constrainCouplingSpectralNorm(self.master_s[l].data, self.dim, self.cfg.spectral_target);
-            const sigma_t = try tensor_mod.constrainCouplingSpectralNorm(self.master_t[l].data, self.dim, self.cfg.spectral_target);
+            const sigma_s = try tensor_mod.constrainCouplingSpectralNorm(&self.master_s[l], self.cfg.spectral_target);
+            const sigma_t = try tensor_mod.constrainCouplingSpectralNorm(&self.master_t[l], self.cfg.spectral_target);
             const target: f64 = self.cfg.spectral_target;
             if (sigma_s > target * (1.0 + SPECTRAL_REPROJECT_REL)) spectral_reprojected = true;
             if (sigma_t > target * (1.0 + SPECTRAL_REPROJECT_REL)) spectral_reprojected = true;
@@ -984,14 +913,14 @@ pub const SFD = struct {
         if (!std.math.isFinite(weight_floor) or weight_floor <= 0.0) return error.InvalidStateFormat;
         if (!std.math.isFinite(fisher_max) or fisher_max <= 0.0) return error.InvalidStateFormat;
         if (warmup_u64 > std.math.maxInt(usize) or size_u64 > std.math.maxInt(usize) or step_u64 > std.math.maxInt(usize)) return error.InvalidStateFormat;
-        const param_size: usize = @intCast(size_u64);
+        const legacy_parameter_count: usize = @intCast(size_u64);
         const expected = try checkedMul(try checkedMul(self.num_layers, self.dim), 4);
-        if (param_size != expected) return error.InvalidStateFormat;
+        if (legacy_parameter_count != expected) return error.InvalidStateFormat;
         var fisher = try Tensor.load(self.allocator, reader);
         defer fisher.deinit();
         var momentum = try Tensor.load(self.allocator, reader);
         defer momentum.deinit();
-        if (fisher.data.len != param_size or momentum.data.len != param_size) return error.InvalidStateFormat;
+        if (fisher.data.len != legacy_parameter_count or momentum.data.len != legacy_parameter_count) return error.InvalidStateFormat;
         const trailing = reader.readByte() catch |err| switch (err) {
             error.EndOfStream => null,
             else => return err,

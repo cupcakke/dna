@@ -51,7 +51,7 @@ fn constrainSpectralNorm(weight: *Tensor, rows: usize, cols: usize, target: f32)
     const expected = try checkedMul(rows, cols);
     if (weight.data.len < expected) return error.DataLengthMismatch;
     try ensureFiniteSlice(weight.data[0..expected]);
-    const sigma = try tensor.constrainCouplingSpectralNorm(weight.data[0..expected], rows, target);
+    const sigma = try tensor.constrainCouplingSpectralNormRaw(weight.data[0..expected], rows, target);
     const sigma_f32: f32 = @floatCast(sigma);
     if (!std.math.isFinite(sigma_f32)) return error.NonFinite;
 }
@@ -169,7 +169,7 @@ fn validateModelConfigValues(dim: usize, num_layers: usize, cfg: RSFConfig) !voi
 fn initOFTBForConfig(dim: usize, global_diffusion: bool) !OFTB {
     if (global_diffusion) {
         _ = try diffusionLayoutForRowLen(try checkedMul(dim, 2));
-        return OFTB.initWithDiffusion(dim, true);
+        return try OFTB.initWithDiffusion(dim, true);
     }
     return OFTB.init(dim);
 }
@@ -248,8 +248,9 @@ const LayerCore = struct {
             if (swg_new) |*t| t.deinit();
             if (twg_new) |*t| t.deinit();
         }
-        if (need_swg) swg_new = try Tensor.zeros(self.allocator, &weight_shape);
-        if (need_twg) twg_new = try Tensor.zeros(self.allocator, &weight_shape);
+        const bindings = layerBindings(self.model_id, self.layer_index, self.dim);
+        if (need_swg) swg_new = try Tensor.initBound(self.allocator, &weight_shape, bindings.gradient);
+        if (need_twg) twg_new = try Tensor.initBound(self.allocator, &weight_shape, bindings.gradient);
         if (swg_new) |t| self.s_weight_grad = t;
         if (twg_new) |t| self.t_weight_grad = t;
         swg_new = null;
@@ -512,6 +513,11 @@ fn assignLayerBindings(core: *RSFCore, model_id: u64) void {
     for (core.layers, 0..) |*layer, index| {
         layer.model_id = model_id;
         layer.layer_index = index;
+        const bindings = layerBindings(model_id, index, layer.dim);
+        layer.s_weight.rsf = bindings.s_weight;
+        layer.t_weight.rsf = bindings.t_weight;
+        if (layer.s_weight_grad) |*gradient| gradient.rsf = bindings.gradient;
+        if (layer.t_weight_grad) |*gradient| gradient.rsf = bindings.gradient;
     }
 }
 
@@ -846,7 +852,7 @@ fn forwardOnCore(core: *const RSFCore, x: *Tensor) !void {
         while (b < batch_size) : (b += 1) {
             const row = x.data[b * dim2 .. b * dim2 + dim2];
             try layer.couplingForwardRow(row, scale, trans);
-            core.oftb.forwardSliceInPlace(row);
+            try core.oftb.forwardSliceInPlace(row);
         }
     }
 }
@@ -869,7 +875,7 @@ fn inverseOnCore(core: *const RSFCore, y: *Tensor) !void {
         var b: usize = 0;
         while (b < batch_size) : (b += 1) {
             const row = y.data[b * dim2 .. b * dim2 + dim2];
-            core.oftb.inverseSliceInPlace(row);
+            try core.oftb.inverseSliceInPlace(row);
             try layer.couplingInverseRow(row, scale, trans);
         }
     }
@@ -897,7 +903,7 @@ fn forwardLogDetOnCore(core: *const RSFCore, x: *Tensor, logdet_per_row: []f32) 
             const row = x.data[b * dim2 .. b * dim2 + dim2];
             const row_logdet = try layer.couplingForwardLogDetRow(row, scale, trans);
             logdet_per_row[b] += row_logdet;
-            core.oftb.forwardSliceInPlace(row);
+            try core.oftb.forwardSliceInPlace(row);
         }
     }
 }
@@ -922,7 +928,7 @@ fn inverseLogDetOnCore(core: *const RSFCore, y: *Tensor, logdet_per_row: []f32) 
         var b: usize = 0;
         while (b < batch_size) : (b += 1) {
             const row = y.data[b * dim2 .. b * dim2 + dim2];
-            core.oftb.inverseSliceInPlace(row);
+            try core.oftb.inverseSliceInPlace(row);
             const row_logdet = try layer.couplingInverseLogDetRow(row, scale, trans);
             logdet_per_row[b] += row_logdet;
         }
@@ -1009,7 +1015,7 @@ fn blockedMeanLogDetAndApplyForward(core: *const RSFCore, blocked: *Tensor, star
             const row = blocked.data[b * dim2 .. b * dim2 + dim2];
             const row_logdet = try layer.couplingForwardLogDetRow(row, scale, trans);
             sum += @as(f64, row_logdet);
-            core.oftb.forwardSliceInPlace(row);
+            try core.oftb.forwardSliceInPlace(row);
         }
         noteLayerApplication(core);
     }
@@ -1042,7 +1048,7 @@ fn blockedMeanLogDetAndApplyInverse(core: *const RSFCore, blocked: *Tensor, star
         var b: usize = 0;
         while (b < batch) : (b += 1) {
             const row = blocked.data[b * dim2 .. b * dim2 + dim2];
-            core.oftb.inverseSliceInPlace(row);
+            try core.oftb.inverseSliceInPlace(row);
             const row_logdet = try layer.couplingInverseLogDetRow(row, scale, trans);
             sum += @as(f64, row_logdet);
         }
@@ -1118,9 +1124,9 @@ fn midpointForwardAdjointOnCore(
         while (b < batch) : (b += 1) {
             const row = state[b * dim2 .. b * dim2 + dim2];
             const grow = grad[b * dim2 .. b * dim2 + dim2];
-            core.oftb.inverseSliceInPlace(row);
+            try core.oftb.inverseSliceInPlace(row);
             try layer.couplingInverseRow(row, scale, trans);
-            core.oftb.backwardSliceInPlace(grow);
+            try core.oftb.backwardSliceInPlace(grow);
             _ = try tensor.couplingAdjointRow(
                 params,
                 row[0..dim],
@@ -1193,7 +1199,7 @@ fn midpointBackwardAdjointOnCore(
             @memcpy(u, row);
             try layer.couplingForwardRow(u, scale, trans);
             @memcpy(o, u);
-            core.oftb.forwardSliceInPlace(o);
+            try core.oftb.forwardSliceInPlace(o);
             _ = try tensor.couplingInvertedFlowAdjointRow(
                 params,
                 u[0..dim],
@@ -1209,7 +1215,7 @@ fn midpointBackwardAdjointOnCore(
                 &scratch,
             );
             @memcpy(grow, gu);
-            core.oftb.forwardSliceInPlace(grow);
+            try core.oftb.forwardSliceInPlace(grow);
             @memcpy(row, o);
         }
         try addLayerParamGrads(layer, ds_buf, dt_buf);
@@ -1446,7 +1452,7 @@ fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tens
         while (l < layer_count) : (l += 1) {
             @memcpy(states[l * dim2 .. l * dim2 + dim2], cur);
             try core.layers[l].couplingForwardRow(cur, scale_buf, trans_buf);
-            core.oftb.forwardSliceInPlace(cur);
+            try core.oftb.forwardSliceInPlace(cur);
         }
         var check: usize = 0;
         while (check < dim2) : (check += 1) {
@@ -1455,7 +1461,7 @@ fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tens
         @memcpy(dy, grad_output.data[b * dim2 .. b * dim2 + dim2]);
         var idx = layer_count;
         while (idx > 0) : (idx -= 1) {
-            core.oftb.backwardSliceInPlace(dy);
+            try core.oftb.backwardSliceInPlace(dy);
             const state = states[(idx - 1) * dim2 .. (idx - 1) * dim2 + dim2];
             try core.layers[idx - 1].backwardFromInputsRow(
                 state[0..dim],
@@ -1686,7 +1692,7 @@ fn forwardSequenceOnCore(core: *const RSFCore, x: *Tensor, mask: *const types.RS
             var t: usize = 0;
             while (t < shape.seq_len) : (t += 1) {
                 scratch.assembleRow(shape, t);
-                core.oftb.forwardSliceInPlace(scratch.row);
+                try core.oftb.forwardSliceInPlace(scratch.row);
                 scratch.splitRow(shape, t);
             }
         }
@@ -1715,7 +1721,7 @@ fn inverseSequenceOnCore(core: *const RSFCore, y: *Tensor, mask: *const types.RS
             var t: usize = 0;
             while (t < shape.seq_len) : (t += 1) {
                 scratch.assembleRow(shape, t);
-                core.oftb.inverseSliceInPlace(scratch.row);
+                try core.oftb.inverseSliceInPlace(scratch.row);
                 scratch.splitRow(shape, t);
             }
             const params = try core.layers[idx - 1].couplingParams();
@@ -1800,7 +1806,7 @@ fn backwardSequenceOnCore(
             var t: usize = 0;
             while (t < shape.seq_len) : (t += 1) {
                 scratch.assembleRow(shape, t);
-                core.oftb.forwardSliceInPlace(scratch.row);
+                try core.oftb.forwardSliceInPlace(scratch.row);
                 scratch.splitRow(shape, t);
             }
             try storeSequenceState(states, shape, layer_count, l + 1, scratch.x1, scratch.x2);
@@ -1821,7 +1827,7 @@ fn backwardSequenceOnCore(
             var t: usize = 0;
             while (t < shape.seq_len) : (t += 1) {
                 scratch.assembleGradientRow(shape, t, g1, g2);
-                core.oftb.backwardSliceInPlace(scratch.row);
+                try core.oftb.backwardSliceInPlace(scratch.row);
                 scratch.splitGradientRow(shape, t, g1, g2);
             }
             try loadSequenceState(states, shape, layer_count, idx - 1, scratch.x1, scratch.x2);
@@ -1829,7 +1835,7 @@ fn backwardSequenceOnCore(
             t = 0;
             while (t < shape.seq_len) : (t += 1) {
                 scratch.assembleGradientRow(shape, t, recovered1, recovered2);
-                core.oftb.inverseSliceInPlace(scratch.row);
+                try core.oftb.inverseSliceInPlace(scratch.row);
                 scratch.splitGradientRow(shape, t, recovered1, recovered2);
             }
             const params = try layer.couplingParams();
@@ -2238,7 +2244,7 @@ pub const RSFLatentState = struct {
         if (batch == 0) return error.InvalidBatchSize;
         const dim = try model.dim();
         const model_id = try handleId(model.id);
-        var data = try Tensor.init(allocator, &[_]usize{ batch, dim, 2 });
+        var data = try Tensor.initLatent(allocator, model_id, dim, batch);
         errdefer data.deinit();
         return .{ .data = data, .log_det = 0.0, .binding = types.RSFBinding.model(.latent_state, model_id, dim) };
     }
@@ -2271,7 +2277,7 @@ pub const RSFLatentState = struct {
 
     pub fn clone(self: *const RSFLatentState, allocator: Allocator) !RSFLatentState {
         const shape = try latentShapeOf(self);
-        var data = try Tensor.init(allocator, &[_]usize{ shape.batch, shape.dim, 2 });
+        var data = try Tensor.initBound(allocator, &[_]usize{ shape.batch, shape.dim, 2 }, self.binding);
         errdefer data.deinit();
         try ensureFiniteSlice(self.data.data);
         @memcpy(data.data, self.data.data);

@@ -1,5 +1,5 @@
 const std = @import("std");
-const SSI = @import("../../index/ssi.zig").SSI;
+const SSI = @import("jaide").ssi.SSI;
 
 extern fn hs_init(argc: *c_int, argv: *[*c][*c]u8) void;
 extern fn hs_exit() void;

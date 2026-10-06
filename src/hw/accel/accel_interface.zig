@@ -2468,7 +2468,7 @@ pub const RSFAccelerator = struct {
         self.releaseCachedMaskUnlocked(owner);
         const bytes = mask.toBytes(self.allocator) catch return AccelError.AllocationFailed;
         defer self.allocator.free(bytes);
-        try self.validateMaskBytes(bytes, mask.seq_len);
+        try validateMaskBytes(bytes, mask.seq_len);
         const handle = try owner.requireHandleUnlocked();
         const seq_i64 = try checkedDimension(mask.seq_len);
         const mask_arr = futhark.futhark_new_u8_2d(handle, bytes.ptr, seq_i64, seq_i64) orelse return owner.recordFailureUnlocked(AccelError.FutharkArrayNewFailed);
@@ -3476,7 +3476,7 @@ pub const RSFAccelerator = struct {
             _ = futhark.futhark_free_f16_3d(handle, out.?);
             return err;
         };
-        var produced = FutharkArray3DF16.adoptUnlocked(owner, out.?, state.dim0, state.dim1, state.dim2);
+        const produced = FutharkArray3DF16.adoptUnlocked(owner, out.?, state.dim0, state.dim1, state.dim2);
         var previous = state.*;
         state.* = produced;
         previous.deinitUnlocked();
@@ -3525,7 +3525,7 @@ pub const RSFAccelerator = struct {
             _ = futhark.futhark_free_f16_3d(handle, out.?);
             return err;
         };
-        var produced = FutharkArray3DF16.adoptUnlocked(owner, out.?, state.dim0, state.dim1, state.dim2);
+        const produced = FutharkArray3DF16.adoptUnlocked(owner, out.?, state.dim0, state.dim1, state.dim2);
         var previous = state.*;
         state.* = produced;
         previous.deinitUnlocked();

@@ -326,15 +326,15 @@ pub const Ranker = struct {
     }
 
     fn headForwardAlloc(self: *Ranker, z: [4]f32, allocator: Allocator) !f32 {
-        var i: usize = 0;
-        while (i < 4) : (i += 1) {
-            if (!std.math.isFinite(z[i])) return error.NonFinite;
-        }
-        var x = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
-        defer x.deinit();
-        @memcpy(x.data[0..RankerConfig.HEAD_STATE], &z);
-        try self.head.forward(&x);
-        const readout = x.data[0] + x.data[1];
+        for (z) |value| if (!std.math.isFinite(value)) return error.NonFinite;
+        var state = try RSFLatentState.init(allocator, &self.head, 1);
+        defer state.deinit();
+        state.data.data[0] = z[0];
+        state.data.data[1] = z[2];
+        state.data.data[2] = z[1];
+        state.data.data[3] = z[3];
+        try self.head.forwardLatent(&state);
+        const readout = state.data.data[0] + state.data.data[2];
         if (!std.math.isFinite(readout)) return error.NonFinite;
         return readout;
     }
@@ -1326,21 +1326,23 @@ pub const Ranker = struct {
 
     fn backwardHeadReadout(self: *Ranker, z: [4]f32, d_readout: f32, allocator: Allocator) !void {
         if (!std.math.isFinite(d_readout) or d_readout == 0.0) return;
-        var input = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        var input = try RSFLatentState.init(allocator, &self.head, 1);
         defer input.deinit();
-        var output = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        input.data.data[0] = z[0];
+        input.data.data[1] = z[2];
+        input.data.data[2] = z[1];
+        input.data.data[3] = z[3];
+        var output = try input.clone(allocator);
         defer output.deinit();
-        @memcpy(input.data[0..RankerConfig.HEAD_STATE], &z);
-        @memcpy(output.data[0..RankerConfig.HEAD_STATE], &z);
-        try self.head.forward(&output);
-        var grad_out = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        try self.head.forwardLatent(&output);
+        var grad_out = try RSFLatentState.init(allocator, &self.head, 1);
         defer grad_out.deinit();
-        @memset(grad_out.data, 0.0);
-        grad_out.data[0] = d_readout;
-        grad_out.data[1] = d_readout;
-        var grad_in = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        @memset(grad_out.data.data, 0.0);
+        grad_out.data.data[0] = d_readout;
+        grad_out.data.data[2] = d_readout;
+        var grad_in = try RSFLatentState.init(allocator, &self.head, 1);
         defer grad_in.deinit();
-        try self.head.backward(&grad_out, &input, &output, &grad_in);
+        try self.head.backwardLatent(&grad_out, &input, &output, &grad_in, 0.0);
     }
 
     pub fn trainHead(self: *Ranker, training_data: []const []const u32, labels: []const f32, ssi: *const SSI, model: *RSF, epochs: usize) !void {

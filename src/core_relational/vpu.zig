@@ -27,6 +27,7 @@ pub const BitmaskMatrix = struct {
     rows: usize,
     cols: usize,
     words_per_row: usize,
+    transposed_words_per_row: usize,
     words: []align(tma_buffer_alignment) u64,
     words_transposed: []align(tma_buffer_alignment) u64,
     total_bits_set: usize,
@@ -38,16 +39,20 @@ pub const BitmaskMatrix = struct {
         if (rows == 0 or cols == 0) return BitmaskMatrixError.ZeroDimension;
         const raw_words = (cols + 63) / 64;
         const padded_words = std.mem.alignForward(usize, raw_words, bitmask_row_alignment_words);
+        const transposed_raw_words = (rows + 63) / 64;
+        const transposed_padded_words = std.mem.alignForward(usize, transposed_raw_words, bitmask_row_alignment_words);
         const total = try std.math.mul(usize, rows, padded_words);
+        const transposed_total = try std.math.mul(usize, cols, transposed_padded_words);
         const words = try allocator.alignedAlloc(u64, tma_buffer_alignment, total);
         errdefer allocator.free(words);
-        const words_transposed = try allocator.alignedAlloc(u64, tma_buffer_alignment, total);
+        const words_transposed = try allocator.alignedAlloc(u64, tma_buffer_alignment, transposed_total);
         @memset(words, 0);
         @memset(words_transposed, 0);
         return BitmaskMatrix{
             .rows = rows,
             .cols = cols,
             .words_per_row = padded_words,
+            .transposed_words_per_row = transposed_padded_words,
             .words = words,
             .words_transposed = words_transposed,
             .total_bits_set = 0,
@@ -82,6 +87,7 @@ pub const BitmaskMatrix = struct {
         self.rows = 0;
         self.cols = 0;
         self.words_per_row = 0;
+        self.transposed_words_per_row = 0;
         self.total_bits_set = 0;
     }
 
@@ -92,7 +98,7 @@ pub const BitmaskMatrix = struct {
         const mask = @as(u64, 1) << bit;
         if ((self.words[word_idx] & mask) == 0) {
             self.words[word_idx] |= mask;
-            self.words_transposed[col * self.words_per_row + (row >> 6)] |= @as(u64, 1) << @as(u6, @intCast(row & 63));
+            self.words_transposed[col * self.transposed_words_per_row + (row >> 6)] |= @as(u64, 1) << @as(u6, @intCast(row & 63));
             self.total_bits_set += 1;
         }
     }
@@ -111,7 +117,7 @@ pub const BitmaskMatrix = struct {
         const mask = @as(u64, 1) << bit;
         if ((self.words[word_idx] & mask) != 0) {
             self.words[word_idx] &= ~mask;
-            self.words_transposed[col * self.words_per_row + (row >> 6)] &= ~(@as(u64, 1) << @as(u6, @intCast(row & 63)));
+            self.words_transposed[col * self.transposed_words_per_row + (row >> 6)] &= ~(@as(u64, 1) << @as(u6, @intCast(row & 63)));
             self.total_bits_set -|= 1;
         }
     }
@@ -129,7 +135,7 @@ pub const BitmaskMatrix = struct {
 
     pub fn transposedRowWords(self: *const BitmaskMatrix, col: usize) []const u64 {
         if (col >= self.cols) return &.{};
-        return self.words_transposed[col * self.words_per_row ..][0..self.words_per_row];
+        return self.words_transposed[col * self.transposed_words_per_row ..][0..self.transposed_words_per_row];
     }
 
     pub fn stateWordCount(self: *const BitmaskMatrix) usize {
@@ -137,7 +143,7 @@ pub const BitmaskMatrix = struct {
     }
 
     pub fn totalBytes(self: *const BitmaskMatrix) usize {
-        return self.words.len * @sizeOf(u64) * 2;
+        return (self.words.len + self.words_transposed.len) * @sizeOf(u64);
     }
 
     pub fn density(self: *const BitmaskMatrix) f32 {
@@ -186,7 +192,7 @@ pub const BitmaskMatrix = struct {
 
     pub fn predecessorPopCounts(self: *const BitmaskMatrix, state: []const u64, counts: []u32) BitmaskMatrixError!void {
         if (counts.len < self.cols) return BitmaskMatrixError.StateShapeMismatch;
-        if (state.len < self.words_per_row) return BitmaskMatrixError.StateShapeMismatch;
+        if (state.len < self.transposed_words_per_row) return BitmaskMatrixError.StateShapeMismatch;
         var col: usize = 0;
         while (col < self.cols) : (col += 1) {
             counts[col] = self.andPopCountTransposedRow(col, state);
