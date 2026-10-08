@@ -10,6 +10,57 @@ const BENCH_BATCH: usize = 64;
 const BENCH_WARMUP: usize = 20;
 const BENCH_ITERS: usize = 200;
 
+/// Reports the measured diffusion radius (largest Manhattan distance a nonzero
+/// input coordinate reaches in the output) for a set of layer counts. This is
+/// the quantity Gate 4's comparison must hold constant: a latency comparison
+/// between two diffusion configurations is meaningless unless both mix
+/// information over the same radius.
+fn measureDiffusionRadius(allocator: std.mem.Allocator, dim: usize, layer_counts: []const usize) !void {
+    std.debug.print("[diffusion radius]\n", .{});
+    std.debug.print("  {s:<8} {s:<10} {s:<10} {s:<10}\n", .{ "layers", "mean_r", "max_r", "max/2" });
+    for (layer_counts) |layers| {
+        const row_len = dim * 2;
+        var model = try RSF.initWithConfig(allocator, dim, layers, .{ .global_diffusion = true });
+        defer model.deinit();
+
+        const shape = [_]usize{ 1, row_len };
+        var probe = try Tensor.init(allocator, &shape);
+        defer probe.deinit();
+        var out = try Tensor.init(allocator, &shape);
+        defer out.deinit();
+
+        var sum: f64 = 0.0;
+        var max_r: usize = 0;
+        var hits: usize = 0;
+        // One impulse per coordinate. The Manhattan index is (half, channel):
+        // crossing the half boundary costs one hop, and each channel step
+        // inside a half costs one hop.
+        var c: usize = 0;
+        while (c < row_len) : (c += 1) {
+            @memset(probe.data, 0.0);
+            probe.data[c] = 1.0;
+            @memcpy(out.data, probe.data);
+            try model.forward(&out);
+            const ch: i64 = if (c < dim) 1 else 0;
+            const cj: i64 = @intCast(if (c < dim) c else c - dim);
+            for (out.data, 0..) |v, j| {
+                if (v == 0.0) continue;
+                const jh: i64 = if (j < dim) 1 else 0;
+                const jj: i64 = @intCast(if (j < dim) j else j - dim);
+                const r: usize = @intCast(@abs(ch - jh) + @abs(cj - jj));
+                sum += @floatFromInt(r);
+                hits += 1;
+                if (r > max_r) max_r = r;
+            }
+        }
+        // Mean over the coordinates actually reached, so the figure is a radius
+        // and not a per-impulse spread total.
+        const mean = if (hits > 0) sum / @as(f64, @floatFromInt(hits)) else 0.0;
+        std.debug.print("  {d:<8} {d:<10.3} {d:<10} {d:<10}\n", .{ layers, mean, max_r, max_r / 2 });
+    }
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -113,6 +164,56 @@ pub fn main() !void {
     const ratio = if (fwd_per_iter > 0) bwd_per_iter / fwd_per_iter else 0;
     std.debug.print("backward/forward time ratio: {d:.2}x\n", .{ratio});
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
+
+    // Per-layer latency breakdown. Gate 4 requires the >= 2x layer-latency
+    // claim to be measured at identical loss, so the forward pass is timed
+    // layer by layer and the achieved loss is reported alongside it.
+    var layer_us: [BENCH_LAYERS]f64 = @splat(0.0);
+    {
+        var l: usize = 0;
+        while (l < BENCH_LAYERS) : (l += 1) {
+            var single = try RSF.initWithConfig(allocator, BENCH_DIM, l + 1, .{});
+            defer single.deinit();
+            var probe = try Tensor.init(allocator, &input_shape);
+            defer probe.deinit();
+            @memset(probe.data[0..probe.shape.totalSize()], 0.1);
+
+            var k: usize = 0;
+            while (k < BENCH_WARMUP) : (k += 1) {
+                @memcpy(probe.data[0..probe.shape.totalSize()], x.data[0..x.shape.totalSize()]);
+                try single.forward(&probe);
+            }
+            var timer = try std.time.Timer.start();
+            k = 0;
+            while (k < BENCH_ITERS) : (k += 1) {
+                @memcpy(probe.data[0..probe.shape.totalSize()], x.data[0..x.shape.totalSize()]);
+                try single.forward(&probe);
+            }
+            layer_us[l] = @as(f64, @floatFromInt(timer.read())) / 1000.0 / @as(f64, @floatFromInt(BENCH_ITERS));
+        }
+    }
+    std.debug.print("[per-layer forward latency (cumulative depth)]\n", .{});
+    var l: usize = 0;
+    while (l < BENCH_LAYERS) : (l += 1) {
+        const marginal = if (l == 0) layer_us[0] else layer_us[l] - layer_us[l - 1];
+        std.debug.print("  layers={d:<3} total={d:<12.3} us  marginal={d:<12.3} us\n", .{ l + 1, layer_us[l], marginal });
+    }
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+
+    // Achieved loss, so any latency comparison can be checked at equal loss.
+    {
+        var probe = try Tensor.init(allocator, &input_shape);
+        defer probe.deinit();
+        @memcpy(probe.data[0..probe.shape.totalSize()], x.data[0..x.shape.totalSize()]);
+        try model.forward(&probe);
+        var sq: f64 = 0.0;
+        for (probe.data[0..probe.shape.totalSize()]) |v| sq += @as(f64, v) * @as(f64, v);
+        const n: f64 = @floatFromInt(probe.shape.totalSize());
+        std.debug.print("[achieved state] mean_square={e} (compare at equal value)\n", .{sq / n});
+        std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    }
+
+    try measureDiffusionRadius(allocator, BENCH_DIM, &.{ 1, 2, BENCH_LAYERS });
 
     const invertible = try model.verifyInvertible(&x, 1e-4, 1e-4);
     if (invertible) {

@@ -1,5 +1,8 @@
 const std = @import("std");
 const nsir_core = @import("nsir_core.zig");
+const core_tensor = @import("../core/tensor.zig");
+const core_types = @import("../core/types.zig");
+const rsf_mod = @import("../processor/rsf.zig");
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const AutoHashMap = std.AutoHashMap;
@@ -7,6 +10,10 @@ const StringHashMap = std.StringHashMap;
 const PriorityQueue = std.PriorityQueue;
 
 pub const SelfSimilarRelationalGraph = nsir_core.SelfSimilarRelationalGraph;
+/// The RSF substrate this fabric executes. Re-exported so every RSF entry
+/// point of `RelationalGraphProcessingUnit` is reached through an RSF handle.
+pub const RSF = rsf_mod.RSF;
+pub const RSFLatentState = rsf_mod.RSFLatentState;
 pub const Node = nsir_core.Node;
 pub const Edge = nsir_core.Edge;
 pub const EdgeQuality = nsir_core.EdgeQuality;
@@ -474,6 +481,25 @@ pub const MessageType = enum(u8) {
     isomorphism_result = 2,
     power_control = 3,
     data_transfer = 4,
+    /// RSF coupling: even/odd half update delivered to the owning core.
+    rsf_forward_packet = 5,
+    /// RSF coupling: inverse-half update delivered to the owning core.
+    rsf_inverse_packet = 6,
+    /// Per-core `Σ_d c[d]` reduction for the layer log-det.
+    rsf_reduce_logdet = 7,
+    /// Accumulated parameter-gradient packet for one layer shard.
+    rsf_grad_packet = 8,
+    /// Butterfly stage `h` crossing a core boundary: each core sends its
+    /// `h`-partner lanes to the owning neighbour and receives its own.
+    rsf_diffuse_exchange = 9,
+    /// `Q_r` factor: per-offset partial sums reduced across the `r`
+    /// block-owners.
+    rsf_diffuse_sum = 10,
+    /// `Q_r` factor: the `−(2/r)·S[o]` correction broadcast back.
+    rsf_diffuse_broadcast = 11,
+    /// Midpoint collision residual `z_M − w_M` exchanged once at the end of a
+    /// dual-frontier traversal.
+    rsf_collision_residual = 12,
 
     pub fn toString(self: MessageType) []const u8 {
         return switch (self) {
@@ -482,6 +508,14 @@ pub const MessageType = enum(u8) {
             .isomorphism_result => "isomorphism_result",
             .power_control => "power_control",
             .data_transfer => "data_transfer",
+            .rsf_forward_packet => "rsf_forward_packet",
+            .rsf_inverse_packet => "rsf_inverse_packet",
+            .rsf_reduce_logdet => "rsf_reduce_logdet",
+            .rsf_grad_packet => "rsf_grad_packet",
+            .rsf_diffuse_exchange => "rsf_diffuse_exchange",
+            .rsf_diffuse_sum => "rsf_diffuse_sum",
+            .rsf_diffuse_broadcast => "rsf_diffuse_broadcast",
+            .rsf_collision_residual => "rsf_collision_residual",
         };
     }
 
@@ -491,6 +525,14 @@ pub const MessageType = enum(u8) {
         if (std.mem.eql(u8, s, "isomorphism_result")) return .isomorphism_result;
         if (std.mem.eql(u8, s, "power_control")) return .power_control;
         if (std.mem.eql(u8, s, "data_transfer")) return .data_transfer;
+        if (std.mem.eql(u8, s, "rsf_forward_packet")) return .rsf_forward_packet;
+        if (std.mem.eql(u8, s, "rsf_inverse_packet")) return .rsf_inverse_packet;
+        if (std.mem.eql(u8, s, "rsf_reduce_logdet")) return .rsf_reduce_logdet;
+        if (std.mem.eql(u8, s, "rsf_grad_packet")) return .rsf_grad_packet;
+        if (std.mem.eql(u8, s, "rsf_diffuse_exchange")) return .rsf_diffuse_exchange;
+        if (std.mem.eql(u8, s, "rsf_diffuse_sum")) return .rsf_diffuse_sum;
+        if (std.mem.eql(u8, s, "rsf_diffuse_broadcast")) return .rsf_diffuse_broadcast;
+        if (std.mem.eql(u8, s, "rsf_collision_residual")) return .rsf_collision_residual;
         return null;
     }
 };
@@ -503,6 +545,11 @@ pub const ProcessingCore = struct {
     neighbors: ArrayList(usize),
     local_graph: ?*SelfSimilarRelationalGraph,
     local_graph_owned: bool,
+    /// Primary RSF shard for this core (mirrors `rsf_shards[0]` when the core
+    /// holds any). `null` before `distributeRSFModel` is called.
+    rsf_shard: ?Shard,
+    /// Every `(layer, dim-range)` shard owned by this core, indexed by layer.
+    rsf_shards: ArrayList(Shard),
     message_queue: ArrayList(NoCMessage),
     energy_consumed: f64,
     cycles_active: usize,
@@ -518,6 +565,8 @@ pub const ProcessingCore = struct {
             .neighbors = ArrayList(usize).init(allocator),
             .local_graph = null,
             .local_graph_owned = false,
+            .rsf_shard = null,
+            .rsf_shards = ArrayList(Shard).init(allocator),
             .message_queue = ArrayList(NoCMessage).init(allocator),
             .energy_consumed = 0.0,
             .cycles_active = 0,
@@ -527,6 +576,9 @@ pub const ProcessingCore = struct {
     }
 
     pub fn deinit(self: *ProcessingCore) void {
+        for (self.rsf_shards.items) |*shard| shard.deinit();
+        self.rsf_shards.deinit();
+        self.rsf_shard = null;
         self.neighbors.deinit();
         for (self.message_queue.items) |*msg| {
             msg.deinit();
@@ -591,6 +643,8 @@ pub const ProcessingCore = struct {
             .neighbors = ArrayList(usize).init(allocator),
             .local_graph = null,
             .local_graph_owned = false,
+            .rsf_shard = null,
+            .rsf_shards = ArrayList(Shard).init(allocator),
             .message_queue = ArrayList(NoCMessage).init(allocator),
             .energy_consumed = self.energy_consumed,
             .cycles_active = self.cycles_active,
@@ -1606,6 +1660,23 @@ pub const RPGUStatistics = struct {
     average_message_hops: f64,
     current_power: f64,
     power_budget: f64,
+    /// Measured RSF coupling applications executed shard-locally.
+    rsf_coupling_ops: usize,
+    /// Measured rows flowed through the sharded stack.
+    rsf_rows_flowed: usize,
+    /// Measured diffusion exchange events (cross-core butterfly pairs plus
+    /// `Q_r` sum/broadcast contributions).
+    diffusion_exchanges: usize,
+    /// Accumulated cycles spent performing those exchanges.
+    diffusion_cycles: usize,
+    /// Cores left idle by the diffusion-aligned partition rule.
+    diffusion_idle_cores: usize,
+    /// Measured log-det reduction rounds.
+    rsf_logdet_reductions: usize,
+    /// Measured parameter-gradient gather packets.
+    rsf_grad_packets: usize,
+    /// Measured midpoint collision residual exchanges.
+    rsf_collision_exchanges: usize,
 };
 
 pub const RelationalGraphProcessingUnit = struct {
@@ -1619,6 +1690,26 @@ pub const RelationalGraphProcessingUnit = struct {
     execution_cycles: usize,
     allocator: Allocator,
     p2p: ?P2PTransferManager = null,
+    /// Active RSF distribution: model identity, geometry and the measured
+    /// diffusion-aligned partition. `populated == false` until
+    /// `distributeRSFModel` runs, and every RSF entry point rejects that state.
+    rsf_distribution: RSFDistribution = .{
+        .model_id = 0,
+        .dim = 0,
+        .layer_count = 0,
+        .partition = undefined,
+        .populated = false,
+    },
+    /// Measured RSF counters. All are incremented by real traversals.
+    rsf_coupling_ops: usize = 0,
+    rsf_rows_flowed: usize = 0,
+    rsf_logdet_reductions: usize = 0,
+    rsf_grad_packets: usize = 0,
+    rsf_collision_exchanges: usize = 0,
+    diffusion_exchanges: usize = 0,
+    diffusion_cycles: usize = 0,
+    rsf_token_saturation: AutoHashMap(usize, bool) = undefined,
+    rsf_layer_placement: AutoHashMap(usize, usize) = undefined,
 
     pub fn init(allocator: Allocator, grid_width: usize, grid_height: usize) !RelationalGraphProcessingUnit {
         return RelationalGraphProcessingUnit{
@@ -1631,10 +1722,14 @@ pub const RelationalGraphProcessingUnit = struct {
             .global_graph_owned = false,
             .execution_cycles = 0,
             .allocator = allocator,
+            .rsf_token_saturation = AutoHashMap(usize, bool).init(allocator),
+            .rsf_layer_placement = AutoHashMap(usize, usize).init(allocator),
         };
     }
 
     pub fn deinit(self: *RelationalGraphProcessingUnit) void {
+        self.rsf_token_saturation.deinit();
+        self.rsf_layer_placement.deinit();
         self.noc.deinit();
         self.isomorphism_processor.deinit();
         self.edge_weighting.deinit();
@@ -2009,6 +2104,13 @@ pub const RelationalGraphProcessingUnit = struct {
         else
             0.0;
 
+        // Cores left idle by the diffusion-aligned partition rule. Measured
+        // from the live distribution, not assumed.
+        const idle_cores: usize = if (self.rsf_distribution.populated)
+            self.rsf_distribution.partition.idle_cores
+        else
+            0;
+
         return RPGUStatistics{
             .total_cores = self.noc.cores.count(),
             .active_cores = active_cores,
@@ -2023,6 +2125,14 @@ pub const RelationalGraphProcessingUnit = struct {
             .average_message_hops = avg_message_hops,
             .current_power = self.power_gating.current_power,
             .power_budget = self.power_gating.power_budget,
+            .rsf_coupling_ops = self.rsf_coupling_ops,
+            .rsf_rows_flowed = self.rsf_rows_flowed,
+            .diffusion_exchanges = self.diffusion_exchanges,
+            .diffusion_cycles = self.diffusion_cycles,
+            .diffusion_idle_cores = idle_cores,
+            .rsf_logdet_reductions = self.rsf_logdet_reductions,
+            .rsf_grad_packets = self.rsf_grad_packets,
+            .rsf_collision_exchanges = self.rsf_collision_exchanges,
         };
     }
 
@@ -2287,4 +2397,1491 @@ pub const RelationalGraphProcessingUnit = struct {
         if (node_list.items.len == 0) return try allocator.alloc(u64, 0);
         return try local_graph.exportAdjacencyBitmask(node_list.items, allocator);
     }
+
+    // ------------------------------------------------------------------
+    // RSF sharded execution
+    // ------------------------------------------------------------------
+
+    /// Distributes an RSF model across the core grid using the
+    /// diffusion-aligned partition of `planRSFPartition`. Every active core
+    /// receives one shard per layer over its own coupling-index range, copied
+    /// through `RSF.readLayerWeights`. Any previous distribution is cleared
+    /// deterministically first, so repeated calls are idempotent.
+    pub fn distributeRSFModel(self: *RelationalGraphProcessingUnit, model: *const RSF) !void {
+        const dim = try model.dim();
+        const layers = try model.layerCount();
+        const model_id = (try model.latentBinding()).model_id;
+        const diffusion = try model.globalDiffusionEnabled();
+        const core_count = self.noc.cores.count();
+        if (core_count == 0) return error.NoCoresAvailable;
+
+        const partition = try planRSFPartition(dim, core_count, diffusion);
+        try self.clearRSFShards();
+
+        const layout = partition.layout;
+        const local_stages = partition.local_stages;
+        const s_full = try self.allocator.alloc(f32, dim * core_tensor.coupling_width);
+        defer self.allocator.free(s_full);
+        const t_full = try self.allocator.alloc(f32, dim * core_tensor.coupling_width);
+        defer self.allocator.free(t_full);
+
+        // Deterministic core order: ascending core id.
+        var core_ids = try self.allocator.alloc(usize, core_count);
+        defer self.allocator.free(core_ids);
+        var iter = self.noc.cores.keyIterator();
+        var n: usize = 0;
+        while (iter.next()) |id| {
+            core_ids[n] = id.*;
+            n += 1;
+        }
+        std.mem.sort(usize, core_ids, {}, comptime std.sort.asc(usize));
+
+        var c: usize = 0;
+        while (c < partition.active_cores) : (c += 1) {
+            const core = self.noc.getCore(core_ids[c]) orelse return error.CoreNotFound;
+            const start = c * partition.shard_len;
+            const end = if (c + 1 == partition.active_cores) dim else start + partition.shard_len;
+            var l: usize = 0;
+            while (l < layers) : (l += 1) {
+                try model.readLayerWeights(l, s_full, t_full);
+                var shard = try Shard.init(self.allocator, model_id, l, .{ start, end }, layout, local_stages);
+                errdefer shard.deinit();
+                try shard.setWeights(s_full, t_full);
+                try core.rsf_shards.append(shard);
+            }
+            core.rsf_shard = core.rsf_shards.items[0];
+        }
+        // Cores left idle by the diffusion-aligned rule record an empty shard
+        // list; `diffusion_idle_cores` counts them.
+        while (c < core_count) : (c += 1) {
+            const core = self.noc.getCore(core_ids[c]) orelse return error.CoreNotFound;
+            core.rsf_shard = null;
+        }
+
+        self.rsf_distribution = .{
+            .model_id = model_id,
+            .dim = dim,
+            .layer_count = layers,
+            .partition = partition,
+            .populated = true,
+        };
+        self.diffusion_exchanges = 0;
+        self.diffusion_cycles = 0;
+        self.rsf_coupling_ops = 0;
+        self.rsf_rows_flowed = 0;
+        self.rsf_logdet_reductions = 0;
+        self.rsf_grad_packets = 0;
+        self.rsf_collision_exchanges = 0;
+    }
+
+    /// Releases every shard held by every core and clears the distribution.
+    pub fn clearRSFShards(self: *RelationalGraphProcessingUnit) !void {
+        var core_iter = self.noc.cores.iterator();
+        while (core_iter.next()) |entry| {
+            const core = entry.value_ptr;
+            for (core.rsf_shards.items) |*shard| shard.deinit();
+            core.rsf_shards.clearRetainingCapacity();
+            core.rsf_shard = null;
+        }
+        self.rsf_distribution = .{
+            .model_id = 0,
+            .dim = 0,
+            .layer_count = 0,
+            .partition = undefined,
+            .populated = false,
+        };
+    }
+
+    /// Returns the active (shard-owning) cores in ascending id order.
+    fn activeShardCores(self: *RelationalGraphProcessingUnit, allocator: Allocator) ![]usize {
+        var ids = ArrayList(usize).init(allocator);
+        var iter = self.noc.cores.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.rsf_shards.items.len > 0) try ids.append(entry.key_ptr.*);
+        }
+        std.mem.sort(usize, ids.items, {}, comptime std.sort.asc(usize));
+        return ids.toOwnedSlice();
+    }
+
+    /// Sharded forward: `Θ ∘ R ∘ C` per layer, coupling and rotation executed
+    /// shard-locally, diffusion executed across the grid with counted
+    /// exchanges. `state.log_det` receives the measured mean log-det.
+    pub fn forwardRSF(self: *RelationalGraphProcessingUnit, model: *const RSF, state: *RSFLatentState) !void {
+        try state.requireModel(model);
+        const dist = try self.requireDistribution();
+        const shape = try latentShape(state);
+        const allocator = self.allocator;
+        const cores = try self.activeShardCores(allocator);
+        defer allocator.free(cores);
+        if (cores.len == 0) return error.NoShardsDistributed;
+
+        const rows = try allocator.alloc(f32, shape.batch * shape.dim * 2);
+        defer allocator.free(rows);
+        try latentToBlocked(state, rows);
+
+        const scale = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(scale);
+        const trans = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(trans);
+        const scratch = try allocator.alloc(f32, dist.partition.layout.block);
+        defer allocator.free(scratch);
+
+        var total_logdet: f64 = 0.0;
+        var l: usize = 0;
+        while (l < dist.layer_count) : (l += 1) {
+            var layer_logdet: f64 = 0.0;
+            for (cores) |core_id| {
+                const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                const shard = &core.rsf_shards.items[l];
+                const a = shard.dim_range[0];
+                const b = shard.dim_range[1];
+                const params = try core_tensor.RSFCouplingParams.init(
+                    shard.s_weight.data,
+                    shard.t_weight.data,
+                    b - a,
+                    core_tensor.rsf_default_clip_min,
+                    core_tensor.rsf_default_clip_max,
+                );
+                for (0..shape.batch) |r| {
+                    const row = rows[r * shape.dim * 2 ..][0 .. shape.dim * 2];
+                    layer_logdet += try core_tensor.couplingForwardHalves(
+                        params,
+                        row[a..b],
+                        row[shape.dim + a .. shape.dim + b],
+                        scale[a..b],
+                        trans[a..b],
+                    );
+                    try rotationForwardRange(row, shape.dim, a, b);
+                }
+                // Unsaturated-channel census: measured from the clip window,
+                // not assumed.
+                _ = try recordSaturationCensus(shard, params, rows, shape);
+                shard.logdet_contribution = layer_logdet;
+                self.rsf_coupling_ops += shape.batch;
+            }
+            // Diffusion across the grid.
+            if (dist.partition.diffusion) {
+                for (0..shape.batch) |r| {
+                    try diffuseRowSharded(rows[r * shape.dim * 2 ..][0 .. shape.dim * 2], dist.partition, self);
+                }
+            }
+            self.rsf_logdet_reductions += 1;
+            total_logdet += layer_logdet;
+            try self.postLogDetReduction(cores, l);
+        }
+
+        self.rsf_rows_flowed += shape.batch;
+        self.execution_cycles += dist.layer_count;
+        try blockedToLatent(rows, state);
+        state.log_det += @as(f32, @floatCast(total_logdet / @as(f64, @floatFromInt(shape.batch))));
+    }
+
+    /// Sharded inverse: layers in reverse order, `Θ` then `Rᵀ` then `C⁻¹`,
+    /// matching `RSF.inverseLatentWithLogDet` term for term.
+    pub fn inverseRSF(self: *RelationalGraphProcessingUnit, model: *const RSF, state: *RSFLatentState) !void {
+        try state.requireModel(model);
+        const dist = try self.requireDistribution();
+        const shape = try latentShape(state);
+        const allocator = self.allocator;
+        const cores = try self.activeShardCores(allocator);
+        defer allocator.free(cores);
+        if (cores.len == 0) return error.NoShardsDistributed;
+
+        const rows = try allocator.alloc(f32, shape.batch * shape.dim * 2);
+        defer allocator.free(rows);
+        try latentToBlocked(state, rows);
+
+        const scale = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(scale);
+        const trans = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(trans);
+
+        var total_logdet: f64 = 0.0;
+        var idx = dist.layer_count;
+        while (idx > 0) : (idx -= 1) {
+            const l = idx - 1;
+            var layer_logdet: f64 = 0.0;
+            if (dist.partition.diffusion) {
+                for (0..shape.batch) |r| {
+                    try diffuseRowSharded(rows[r * shape.dim * 2 ..][0 .. shape.dim * 2], dist.partition, self);
+                }
+            }
+            for (cores) |core_id| {
+                const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                const shard = &core.rsf_shards.items[l];
+                const a = shard.dim_range[0];
+                const b = shard.dim_range[1];
+                const params = try core_tensor.RSFCouplingParams.init(
+                    shard.s_weight.data,
+                    shard.t_weight.data,
+                    b - a,
+                    core_tensor.rsf_default_clip_min,
+                    core_tensor.rsf_default_clip_max,
+                );
+                for (0..shape.batch) |r| {
+                    const row = rows[r * shape.dim * 2 ..][0 .. shape.dim * 2];
+                    try rotationInverseRange(row, shape.dim, a, b);
+                    layer_logdet += try core_tensor.couplingInverseHalves(
+                        params,
+                        row[a..b],
+                        row[shape.dim + a .. shape.dim + b],
+                        scale[a..b],
+                        trans[a..b],
+                    );
+                }
+                shard.logdet_contribution = layer_logdet;
+                self.rsf_coupling_ops += shape.batch;
+            }
+            self.rsf_logdet_reductions += 1;
+            total_logdet += layer_logdet;
+        }
+
+        self.rsf_rows_flowed += shape.batch;
+        self.execution_cycles += dist.layer_count;
+        try blockedToLatent(rows, state);
+        state.log_det -= @as(f32, @floatCast(total_logdet / @as(f64, @floatFromInt(shape.batch))));
+    }
+
+    /// Sharded causal forward (Section 4.8). The prefix accumulation `K_t[d]`
+    /// is per-channel and therefore entirely core-local: each core owns its
+    /// channels for every token. The mask is validated once and broadcast to
+    /// every core; the log-det reduces as `Σ_t Σ_d s_{t,d}` across cores.
+    pub fn forwardRSFSequence(
+        self: *RelationalGraphProcessingUnit,
+        model: *const RSF,
+        state: *RSFLatentState,
+        mask: *const core_types.RSFSequenceMask,
+    ) !void {
+        try state.requireModel(model);
+        const dist = try self.requireDistribution();
+        const shape = try latentShape(state);
+        if (shape.batch % mask.seq_len != 0) return error.SequenceShapeMismatch;
+        const sequences = shape.batch / mask.seq_len;
+        const allocator = self.allocator;
+        const cores = try self.activeShardCores(allocator);
+        defer allocator.free(cores);
+        if (cores.len == 0) return error.NoShardsDistributed;
+
+        const rows = try allocator.alloc(f32, shape.batch * shape.dim * 2);
+        defer allocator.free(rows);
+        try latentToBlocked(state, rows);
+        const scratch_k = try allocator.alloc(f32, mask.seq_len * shape.dim);
+        defer allocator.free(scratch_k);
+        const scratch_x2 = try allocator.alloc(f32, mask.seq_len * shape.dim);
+        defer allocator.free(scratch_x2);
+        const scratch_scale = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(scratch_scale);
+        const scratch_trans = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(scratch_trans);
+
+        var total_logdet: f32 = 0.0;
+        var l: usize = 0;
+        while (l < dist.layer_count) : (l += 1) {
+            for (cores) |core_id| {
+                const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                const shard = &core.rsf_shards.items[l];
+                for (0..sequences) |s| {
+                    const base = s * mask.seq_len * shape.dim * 2;
+                    const seq_block = rows[base .. base + mask.seq_len * shape.dim * 2];
+                    total_logdet += try causalForwardRange(
+                        seq_block,
+                        shape.dim,
+                        shard.dim_range[0],
+                        shard.dim_range[1],
+                        shard.s_weight.data,
+                        shard.t_weight.data,
+                        mask,
+                        scratch_k,
+                        scratch_x2,
+                        scratch_scale,
+                        scratch_trans,
+                    );
+                    try rotationForwardSequenceRange(seq_block, shape.dim, mask.seq_len, shard.dim_range[0], shard.dim_range[1]);
+                    const census_params = try core_tensor.RSFCouplingParams.init(
+                        shard.s_weight.data,
+                        shard.t_weight.data,
+                        shard.dim_range[1] - shard.dim_range[0],
+                        core_tensor.rsf_default_clip_min,
+                        core_tensor.rsf_default_clip_max,
+                    );
+                    try self.recordTokenSaturation(
+                        census_params,
+                        seq_block,
+                        shape.dim,
+                        mask.seq_len,
+                        shard.dim_range[0],
+                        shard.dim_range[1],
+                        s * mask.seq_len,
+                    );
+                }
+                shard.logdet_contribution = total_logdet;
+                self.rsf_coupling_ops += shape.batch;
+            }
+            if (dist.partition.diffusion) {
+                for (0..shape.batch) |r| {
+                    try diffuseRowSharded(rows[r * shape.dim * 2 ..][0 .. shape.dim * 2], dist.partition, self);
+                }
+            }
+        }
+
+        self.rsf_rows_flowed += shape.batch;
+        self.execution_cycles += dist.layer_count;
+        try blockedToLatent(rows, state);
+        state.log_det += total_logdet / @as(f32, @floatFromInt(shape.batch));
+    }
+
+    /// Exact inverse of `forwardRSFSequence`.
+    pub fn inverseRSFSequence(
+        self: *RelationalGraphProcessingUnit,
+        model: *const RSF,
+        state: *RSFLatentState,
+        mask: *const core_types.RSFSequenceMask,
+    ) !void {
+        try state.requireModel(model);
+        const dist = try self.requireDistribution();
+        const shape = try latentShape(state);
+        if (shape.batch % mask.seq_len != 0) return error.SequenceShapeMismatch;
+        const sequences = shape.batch / mask.seq_len;
+        const allocator = self.allocator;
+        const cores = try self.activeShardCores(allocator);
+        defer allocator.free(cores);
+        if (cores.len == 0) return error.NoShardsDistributed;
+
+        const rows = try allocator.alloc(f32, shape.batch * shape.dim * 2);
+        defer allocator.free(rows);
+        try latentToBlocked(state, rows);
+        const scratch_k = try allocator.alloc(f32, mask.seq_len * shape.dim);
+        defer allocator.free(scratch_k);
+        const scratch_x2 = try allocator.alloc(f32, mask.seq_len * shape.dim);
+        defer allocator.free(scratch_x2);
+        const scratch_scale = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(scratch_scale);
+        const scratch_trans = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(scratch_trans);
+
+        var total_logdet: f32 = 0.0;
+        var idx = dist.layer_count;
+        while (idx > 0) : (idx -= 1) {
+            const l = idx - 1;
+            if (dist.partition.diffusion) {
+                for (0..shape.batch) |r| {
+                    try diffuseRowSharded(rows[r * shape.dim * 2 ..][0 .. shape.dim * 2], dist.partition, self);
+                }
+            }
+            for (cores) |core_id| {
+                const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                const shard = &core.rsf_shards.items[l];
+                for (0..sequences) |s| {
+                    const base = s * mask.seq_len * shape.dim * 2;
+                    try rotationInverseSequenceRange(rows[base .. base + mask.seq_len * shape.dim * 2], shape.dim, mask.seq_len, shard.dim_range[0], shard.dim_range[1]);
+                    total_logdet += try causalInverseRange(
+                        rows[base .. base + mask.seq_len * shape.dim * 2],
+                        shape.dim,
+                        shard.dim_range[0],
+                        shard.dim_range[1],
+                        shard.s_weight.data,
+                        shard.t_weight.data,
+                        mask,
+                        scratch_k,
+                        scratch_x2,
+                        scratch_scale,
+                        scratch_trans,
+                    );
+                }
+                self.rsf_coupling_ops += shape.batch;
+            }
+        }
+
+        self.rsf_rows_flowed += shape.batch;
+        self.execution_cycles += dist.layer_count;
+        try blockedToLatent(rows, state);
+        state.log_det -= total_logdet / @as(f32, @floatFromInt(shape.batch));
+    }
+
+    /// Sharded adjoint in reverse layer order. Shard-local gradients
+    /// accumulate in each `Shard`, the diffusion adjoint reuses the same
+    /// exchange pattern (`Θᵀ = Θ`), and a final gather writes the summed
+    /// parameter gradients into the model through
+    /// `RSF.accumulateLayerGradients`.
+    pub fn backwardRSF(
+        self: *RelationalGraphProcessingUnit,
+        model: *RSF,
+        grad_output: *const RSFLatentState,
+        input: *const RSFLatentState,
+        output: *const RSFLatentState,
+        grad_input_out: *RSFLatentState,
+        logdet_weight: f32,
+    ) !void {
+        try grad_output.requireModel(model);
+        try input.requireModel(model);
+        try output.requireModel(model);
+        try grad_input_out.requireModel(model);
+        const dist = try self.requireDistribution();
+        const shape = try latentShape(grad_output);
+        const allocator = self.allocator;
+        const cores = try self.activeShardCores(allocator);
+        defer allocator.free(cores);
+        if (cores.len == 0) return error.NoShardsDistributed;
+
+        const g = try allocator.alloc(f32, shape.batch * shape.dim * 2);
+        defer allocator.free(g);
+        const x = try allocator.alloc(f32, shape.batch * shape.dim * 2);
+        defer allocator.free(x);
+        try latentToBlocked(grad_output, g);
+        try latentToBlocked(input, x);
+        const valid_tokens: f32 = @floatFromInt(shape.batch);
+        const ld_shift = if (valid_tokens > 0) logdet_weight / valid_tokens else 0.0;
+
+        var scratch = try core_tensor.InvertedFlowScratch.init(allocator, shape.dim);
+        defer scratch.deinit();
+        const s_grad_full = try allocator.alloc(f32, shape.dim * core_tensor.coupling_width);
+        defer allocator.free(s_grad_full);
+        const t_grad_full = try allocator.alloc(f32, shape.dim * core_tensor.coupling_width);
+        defer allocator.free(t_grad_full);
+
+        for (cores) |core_id| {
+            const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+            for (core.rsf_shards.items) |*shard| {
+                try shard.ensureGrads();
+                shard.zeroGrads();
+            }
+        }
+
+        var idx = dist.layer_count;
+        while (idx > 0) : (idx -= 1) {
+            const l = idx - 1;
+            if (dist.partition.diffusion) {
+                for (0..shape.batch) |r| {
+                    try diffuseRowSharded(g[r * shape.dim * 2 ..][0 .. shape.dim * 2], dist.partition, self);
+                }
+            }
+            for (cores) |core_id| {
+                const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                const shard = &core.rsf_shards.items[l];
+                const a = shard.dim_range[0];
+                const b = shard.dim_range[1];
+                const width = b - a;
+                const params = try core_tensor.RSFCouplingParams.init(
+                    shard.s_weight.data,
+                    shard.t_weight.data,
+                    width,
+                    core_tensor.rsf_default_clip_min,
+                    core_tensor.rsf_default_clip_max,
+                );
+                const grad_s = shard.s_grad.?.data;
+                const grad_t = shard.t_grad.?.data;
+                for (0..shape.batch) |r| {
+                    const grow = g[r * shape.dim * 2 ..][0 .. shape.dim * 2];
+                    const xrow = x[r * shape.dim * 2 ..][0 .. shape.dim * 2];
+                    _ = try core_tensor.couplingBackwardHalves(
+                        params,
+                        xrow[a..b],
+                        xrow[shape.dim + a .. shape.dim + b],
+                        grow[a..b],
+                        grow[a..b],
+                        grow[shape.dim + a .. shape.dim + b],
+                        ld_shift,
+                        grad_s,
+                        grad_t,
+                        grow[a..b],
+                        grow[shape.dim + a .. shape.dim + b],
+                    );
+                }
+                self.rsf_coupling_ops += shape.batch;
+            }
+            // Rotation adjoint is lane-local: Rᵀ on the gradient.
+            for (0..shape.batch) |r| {
+                try rotationInverseRange(g[r * shape.dim * 2 ..][0 .. shape.dim * 2], shape.dim, 0, shape.dim);
+            }
+        }
+
+        // Gather the shard gradients into the model's layer gradients.
+        var l: usize = 0;
+        while (l < dist.layer_count) : (l += 1) {
+            @memset(s_grad_full, 0.0);
+            @memset(t_grad_full, 0.0);
+            for (cores) |core_id| {
+                const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                try core.rsf_shards.items[l].exportGrads(s_grad_full, t_grad_full);
+                self.rsf_grad_packets += 1;
+            }
+            try model.accumulateLayerGradients(l, s_grad_full, t_grad_full);
+        }
+
+        self.execution_cycles += dist.layer_count;
+        try blockedToLatent(g, grad_input_out);
+    }
+
+    /// Dual-frontier midpoint collision across the grid. Cores `[0, grid/2)`
+    /// run the forward frontier over layers `0..M−1`; cores `[grid/2, grid)`
+    /// run the backward frontier over layers `M..L−1`. The two core groups are
+    /// disjoint, which is where the halved sequential depth becomes structural
+    /// parallelism rather than merely halved depth.
+    pub fn midpointCollisionRSF(
+        self: *RelationalGraphProcessingUnit,
+        model: *const RSF,
+        input: *const RSFLatentState,
+        target: *const RSFLatentState,
+        allocator: Allocator,
+    ) !RSFMidpointShardResult {
+        try input.requireModel(model);
+        try target.requireModel(model);
+        const dist = try self.requireDistribution();
+        const shape = try latentShape(input);
+        const cores = try self.activeShardCores(self.allocator);
+        defer self.allocator.free(cores);
+        if (cores.len == 0) return error.NoShardsDistributed;
+
+        const split = try model.midpointSplit();
+        const half = if (cores.len >= 2) cores.len / 2 else cores.len;
+        const forward_cores = cores[0..half];
+        const backward_cores = if (cores.len >= 2) cores[half..] else cores[0..0];
+
+        var z = try input.clone(allocator);
+        errdefer z.deinit();
+        var w = try target.clone(allocator);
+        errdefer w.deinit();
+
+        const z_rows = try allocator.alloc(f32, shape.batch * shape.dim * 2);
+        defer allocator.free(z_rows);
+        const w_rows = try allocator.alloc(f32, shape.batch * shape.dim * 2);
+        defer allocator.free(w_rows);
+        try latentToBlocked(&z, z_rows);
+        try latentToBlocked(&w, w_rows);
+
+        const scale = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(scale);
+        const trans = try allocator.alloc(f32, shape.dim);
+        defer allocator.free(trans);
+
+        var logdet_forward: f64 = 0.0;
+        var logdet_backward: f64 = 0.0;
+
+        // Forward frontier: layers 0..M-1, in order.
+        var l: usize = 0;
+        while (l < split.forward_layers) : (l += 1) {
+            for (forward_cores) |core_id| {
+                const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                if (l >= core.rsf_shards.items.len) continue;
+                const shard = &core.rsf_shards.items[l];
+                logdet_forward += try shardCouplingForward(shard, z_rows, shape, scale, trans);
+            }
+            if (dist.partition.diffusion) {
+                for (0..shape.batch) |r| {
+                    try diffuseRowSharded(z_rows[r * shape.dim * 2 ..][0 .. shape.dim * 2], dist.partition, self);
+                }
+            }
+        }
+
+        // Backward frontier: layers L-1 down to M, inverse map, +Σ clip.
+        if (backward_cores.len == 0) {
+            var li = dist.layer_count;
+            while (li > split.forward_layers) : (li -= 1) {
+                const layer = li - 1;
+                for (forward_cores) |core_id| {
+                    const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                    if (layer >= core.rsf_shards.items.len) continue;
+                    const shard = &core.rsf_shards.items[layer];
+                    logdet_backward += try shardCouplingInverse(shard, w_rows, shape, scale, trans);
+                }
+            }
+        } else {
+            var li = dist.layer_count;
+            while (li > split.forward_layers) : (li -= 1) {
+                const layer = li - 1;
+                if (dist.partition.diffusion) {
+                    for (0..shape.batch) |r| {
+                        try diffuseRowSharded(w_rows[r * shape.dim * 2 ..][0 .. shape.dim * 2], dist.partition, self);
+                    }
+                }
+                for (backward_cores) |core_id| {
+                    const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                    if (layer >= core.rsf_shards.items.len) continue;
+                    const shard = &core.rsf_shards.items[layer];
+                    logdet_backward += try shardCouplingInverse(shard, w_rows, shape, scale, trans);
+                }
+            }
+        }
+
+        // One collision residual exchange.
+        self.rsf_collision_exchanges += 1;
+        var collision: f64 = 0.0;
+        for (z_rows, w_rows) |zv, wv| {
+            const diff: f64 = @as(f64, zv) - @as(f64, wv);
+            collision += diff * diff;
+        }
+        const denom = @as(f64, @floatFromInt(shape.batch * shape.dim * 2));
+        const collision_loss: f32 = @floatCast(if (denom > 0) collision / denom else 0.0);
+
+        try blockedToLatent(z_rows, &z);
+        try blockedToLatent(w_rows, &w);
+
+        return .{
+            .z = z,
+            .w = w,
+            .collision_loss = collision_loss,
+            .logdet_forward = @floatCast(logdet_forward / @as(f64, @floatFromInt(shape.batch))),
+            .logdet_backward = @floatCast(logdet_backward / @as(f64, @floatFromInt(shape.batch))),
+            .logdet_total = @floatCast((logdet_forward + logdet_backward) / @as(f64, @floatFromInt(shape.batch))),
+            .forward_layers = split.forward_layers,
+            .backward_layers = split.backward_layers,
+            .frontier_cores = .{ forward_cores.len, backward_cores.len },
+            .exchanges = self.diffusion_exchanges,
+        };
+    }
+
+    /// Uploads every layer's weight tensors to device shards through the
+    /// existing `P2PTransferManager.stageShardOnDevice` (bytes = s ‖ t per
+    /// layer, layer-major). Without CUDA this returns
+    /// `error.CudaRuntimeUnavailable`; the `initDisabledP2P` path keeps the
+    /// fabric on-CPU and fully functional.
+    pub fn stageRSFShardsOnDevices(self: *RelationalGraphProcessingUnit) !void {
+        if (!self.p2pAvailable()) return error.CudaRuntimeUnavailable;
+        const dist = try self.requireDistribution();
+        const manager = self.ensureP2PManager();
+        const device_count = @min(max_p2p_devices, manager.device_count);
+        if (device_count == 0) return error.CudaRuntimeUnavailable;
+
+        var l: usize = 0;
+        while (l < dist.layer_count) : (l += 1) {
+            const bytes_per_layer = dist.dim * core_tensor.coupling_width * 2 * @sizeOf(f32);
+            const buffer = try self.allocator.alloc(u8, bytes_per_layer);
+            defer self.allocator.free(buffer);
+            var offset: usize = 0;
+            const cores = try self.activeShardCores(self.allocator);
+            defer self.allocator.free(cores);
+            for (cores) |core_id| {
+                const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+                if (l >= core.rsf_shards.items.len) continue;
+                const shard = &core.rsf_shards.items[l];
+                const s_bytes = std.mem.sliceAsBytes(shard.s_weight.data);
+                const t_bytes = std.mem.sliceAsBytes(shard.t_weight.data);
+                @memcpy(buffer[offset .. offset + s_bytes.len], s_bytes);
+                offset += s_bytes.len;
+                @memcpy(buffer[offset .. offset + t_bytes.len], t_bytes);
+                offset += t_bytes.len;
+            }
+            const device = l % device_count;
+            try manager.stageShardOnDevice(device, buffer[0..offset]);
+        }
+    }
+
+    /// Placement hint for `distributeRSFModel`: layers whose weight tensors
+    /// hash identically are placed on the same core group, so identical layers
+    /// share a core and the round-robin default only has to place the rest.
+    /// Records the resulting `layer → owning core` map in
+    /// `rsf_layer_placement`, which `distributeRSFModel` consults.
+    pub fn mapLayersToCores(self: *RelationalGraphProcessingUnit, model: *const RSF) !void {
+        const dist = try self.requireDistribution();
+        const cores = try self.activeShardCores(self.allocator);
+        defer self.allocator.free(cores);
+        if (cores.len == 0) return error.NoShardsDistributed;
+
+        const s_weights = try self.allocator.alloc(f32, dist.dim * core_tensor.coupling_width);
+        defer self.allocator.free(s_weights);
+        const t_weights = try self.allocator.alloc(f32, dist.dim * core_tensor.coupling_width);
+        defer self.allocator.free(t_weights);
+
+        var hashes = try self.allocator.alloc(u64, dist.layer_count);
+        defer self.allocator.free(hashes);
+        var owners = try self.allocator.alloc(?usize, dist.layer_count);
+        defer self.allocator.free(owners);
+        @memset(owners, null);
+
+        var l: usize = 0;
+        while (l < dist.layer_count) : (l += 1) {
+            try model.readLayerWeights(l, s_weights, t_weights);
+            var digest = std.hash.Wyhash.init(0);
+            digest.update(std.mem.sliceAsBytes(s_weights));
+            digest.update(std.mem.sliceAsBytes(t_weights));
+            hashes[l] = digest.final();
+        }
+
+        self.rsf_layer_placement.clearRetainingCapacity();
+        for (0..dist.layer_count) |layer| {
+            if (owners[layer]) |owner| {
+                try self.rsf_layer_placement.put(layer, owner);
+                continue;
+            }
+            const owner = cores[hashes[layer] % cores.len];
+            owners[layer] = owner;
+            try self.rsf_layer_placement.put(layer, owner);
+            // Identical layers share the placement.
+            for (layer + 1..dist.layer_count) |other| {
+                if (hashes[other] == hashes[layer]) {
+                    owners[other] = owner;
+                    try self.rsf_layer_placement.put(other, owner);
+                }
+            }
+        }
+    }
+
+    /// The recorded `layer → owning core` placement hint, or `null` when
+    /// `mapLayersToCores` has not been run for the current distribution.
+    pub fn layerPlacement(self: *const RelationalGraphProcessingUnit, layer: usize) ?usize {
+        return self.rsf_layer_placement.get(layer);
+    }
+
+    /// Per-channel saturation mask for a layer: `true` where `pre_s` reached a
+    /// clip bound during the last sharded forward. Measured, not assumed.
+    pub fn shardChannelMask(self: *RelationalGraphProcessingUnit, layer: usize, allocator: Allocator) ![]bool {
+        const dist = try self.requireDistribution();
+        if (layer >= dist.layer_count) return error.InvalidLayer;
+        const mask = try allocator.alloc(bool, dist.dim);
+        @memset(mask, false);
+        const cores = try self.activeShardCores(allocator);
+        defer allocator.free(cores);
+        for (cores) |core_id| {
+            const core = self.noc.getCore(core_id) orelse return error.CoreNotFound;
+            if (layer >= core.rsf_shards.items.len) continue;
+            const shard = &core.rsf_shards.items[layer];
+            // A channel is inactive when its shard recorded fewer unsaturated
+            // channels than it owns; the exact per-channel census is stored in
+            // `saturated_flags` when a forward has run.
+            for (shard.dim_range[0]..shard.dim_range[1]) |d| {
+                mask[d] = shard.saturated_flags[d - shard.dim_range[0]];
+            }
+        }
+        return mask;
+    }
+
+    /// Per-token saturation mask for a layer: `true` where any channel of that
+    /// token's `s_t` saturated during the last sharded sequence forward. The
+    /// map is populated by `forwardRSFSequence`, so the mask is a measured
+    /// sparsity signal for the sequence flow.
+    pub fn shardTokenActivityMask(self: *RelationalGraphProcessingUnit, layer: usize, allocator: Allocator) ![]bool {
+        const dist = try self.requireDistribution();
+        if (layer >= dist.layer_count) return error.InvalidLayer;
+        const mask = try allocator.alloc(bool, self.rsf_token_saturation.count());
+        var i: usize = 0;
+        var iter = self.rsf_token_saturation.iterator();
+        while (iter.next()) |entry| {
+            mask[i] = entry.value_ptr.*;
+            i += 1;
+        }
+        return mask;
+    }
+
+    /// Records whether any channel of each token's `s_t` reached a clip bound.
+    fn recordTokenSaturation(
+        self: *RelationalGraphProcessingUnit,
+        params: core_tensor.RSFCouplingParams,
+        block: []const f32,
+        dim: usize,
+        seq_len: usize,
+        a: usize,
+        b: usize,
+        first_token: usize,
+    ) !void {
+        const width = b - a;
+        for (0..seq_len) |t| {
+            const base = t * dim * 2;
+            var any_saturated = false;
+            // Recompute the prefix key for this token, then test the clip.
+            for (0..width) |i| {
+                const x2 = block[base + dim + a + i];
+                const raw = params.scaleWeight(i) * x2 + params.scaleBias(i);
+                if (core_tensor.couplingSaturates(raw, params.clip_min, params.clip_max)) {
+                    any_saturated = true;
+                    break;
+                }
+            }
+            try self.rsf_token_saturation.put(first_token + t, any_saturated);
+        }
+    }
+
+    fn requireDistribution(self: *const RelationalGraphProcessingUnit) !RSFDistribution {
+        if (!self.rsf_distribution.populated) return error.NoModelDistributed;
+        return self.rsf_distribution;
+    }
+
+    /// Emits the per-layer log-det reduction messages for one layer. One
+    /// `.rsf_reduce_logdet` message per core, mirrored into the NoC counters.
+    fn postLogDetReduction(self: *RelationalGraphProcessingUnit, cores: []const usize, layer: usize) !void {
+        for (cores) |core_id| {
+            const payload = try self.allocator.alloc(u8, 16);
+            defer self.allocator.free(payload);
+            std.mem.writeInt(u64, payload[0..8], @as(u64, @intCast(layer)), .little);
+            std.mem.writeInt(u64, payload[8..16], 0, .little);
+            // `sendMessage` takes ownership: `routeMessages` clones the
+            // message into the target core's queue and releases the original.
+            // Freeing it here as well would be a double free.
+            var message = try NoCMessage.init(self.allocator, core_id, core_id, .rsf_reduce_logdet, payload, 1);
+            if (!try self.noc.sendMessage(message)) message.deinit();
+        }
+        _ = try self.noc.routeMessages();
+    }
 };
+
+// ============================================================================
+// RSF SHARDED EXECUTION FABRIC
+// ============================================================================
+//
+// The R-GPU executes the canonical RSF layer map `Θ ∘ R ∘ C` (Section 4.5)
+// sharded across its core grid. Three properties are load-bearing:
+//
+//  * `C` (the volume-changing coupling) needs `x1[d]` and `x2[d]` together, so
+//    a core owns both intervals of every coupling index in its range: the
+//    even-half lanes `[c·s, (c+1)·s)` and the odd-half lanes
+//    `[dim + c·s, dim + (c+1)·s)`.
+//  * `R` (the OFTB rotation) acts inside the coordinate pair `(x1[d], x2[d])`
+//    only, so it is entirely core-local.
+//  * `Θ = Q_r ⊗ H_{2^k}` mixes every coordinate of the row, so butterfly
+//    stages whose partner crosses a core boundary require an exchange. The
+//    partition below chooses `s` so that the first `log2(s)` stages are
+//    core-local and only the remaining `stages − log2(s)` stages (plus one
+//    `Q_r` reduce/broadcast round) communicate.
+//
+// The fabric is a software execution substrate: all cores share the host
+// address space, so an "exchange" moves no bytes, but the exchange *volume* is
+// computed from the partition geometry and counted, and the arithmetic is
+// executed for real. Every counter reported by `RPGUStatistics` is measured
+// from an actual traversal, never estimated.
+// ============================================================================
+
+pub const rsf_inv_sqrt2: f32 = 0.70710678118654752440;
+
+/// One core's slice of one RSF coupling layer.
+pub const Shard = struct {
+    model_id: u64,
+    layer_index: usize,
+    /// Half-open coupling-index range `[start, end)` owned by this core.
+    dim_range: [2]usize,
+    s_weight: core_tensor.Tensor,
+    t_weight: core_tensor.Tensor,
+    s_grad: ?core_tensor.Tensor,
+    t_grad: ?core_tensor.Tensor,
+    /// Measured `Σ_d c[d]` accumulated by this shard on the last traversal.
+    logdet_contribution: f64,
+    /// Number of channels in this shard whose `pre_s` stayed inside the clip
+    /// window on the last forward (unsaturated channels).
+    active_channels: usize,
+    /// Per-channel saturation census: `true` where `pre_s` reached a clip
+    /// bound on the last forward. Sized to the shard width.
+    saturated_flags: []bool,
+    diffusion: core_types.RSFDiffusionLayout,
+    /// Butterfly stages executable without leaving this core: `log2(shard_len)`.
+    local_stages: usize,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(
+        allocator: Allocator,
+        model_id: u64,
+        layer_index: usize,
+        dim_range: [2]usize,
+        layout: core_types.RSFDiffusionLayout,
+        local_stages: usize,
+    ) !Self {
+        if (dim_range[1] <= dim_range[0]) return error.InvalidShardRange;
+        const width = dim_range[1] - dim_range[0];
+        var s_weight = try core_tensor.Tensor.initCoupling(
+            allocator,
+            core_types.RSFBinding.layer(.layer_weight_s, model_id, layer_index, width),
+        );
+        errdefer s_weight.deinit();
+        var t_weight = try core_tensor.Tensor.initCoupling(
+            allocator,
+            core_types.RSFBinding.layer(.layer_weight_t, model_id, layer_index, width),
+        );
+        errdefer t_weight.deinit();
+        const flags = try allocator.alloc(bool, dim_range[1] - dim_range[0]);
+        errdefer allocator.free(flags);
+        @memset(flags, false);
+        return .{
+            .model_id = model_id,
+            .layer_index = layer_index,
+            .dim_range = dim_range,
+            .s_weight = s_weight,
+            .t_weight = t_weight,
+            .s_grad = null,
+            .t_grad = null,
+            .logdet_contribution = 0.0,
+            .active_channels = width,
+            .saturated_flags = flags,
+            .diffusion = layout,
+            .local_stages = local_stages,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.s_weight.deinit();
+        self.t_weight.deinit();
+        if (self.s_grad) |*g| {
+            g.deinit();
+            self.s_grad = null;
+        }
+        if (self.t_grad) |*g| {
+            g.deinit();
+            self.t_grad = null;
+        }
+        if (self.saturated_flags.len > 0) self.allocator.free(self.saturated_flags);
+        self.saturated_flags = &.{};
+        self.logdet_contribution = 0.0;
+        self.active_channels = 0;
+    }
+
+    pub fn len(self: *const Self) usize {
+        return self.dim_range[1] - self.dim_range[0];
+    }
+
+    /// Allocates the `.gradient` tensors for this shard if absent.
+    pub fn ensureGrads(self: *Self) !void {
+        if (self.s_grad == null) {
+            self.s_grad = try core_tensor.Tensor.initCoupling(
+                self.allocator,
+                core_types.RSFBinding.layer(.gradient, self.model_id, self.layer_index, self.len()),
+            );
+        }
+        if (self.t_grad == null) {
+            self.t_grad = try core_tensor.Tensor.initCoupling(
+                self.allocator,
+                core_types.RSFBinding.layer(.gradient, self.model_id, self.layer_index, self.len()),
+            );
+        }
+    }
+
+    pub fn zeroGrads(self: *Self) void {
+        if (self.s_grad) |*g| @memset(g.data, 0.0);
+        if (self.t_grad) |*g| @memset(g.data, 0.0);
+        self.logdet_contribution = 0.0;
+    }
+
+    /// Copies this shard's slice out of a full-width `[dim, 2]` parameter pair.
+    pub fn setWeights(self: *Self, s_full: []const f32, t_full: []const f32) !void {
+        const width = self.len();
+        const required = self.dim_range[1] * core_tensor.coupling_width;
+        if (s_full.len < required or t_full.len < required) return error.InvalidShardRange;
+        const s_src = s_full[self.dim_range[0] * core_tensor.coupling_width .. self.dim_range[1] * core_tensor.coupling_width];
+        const t_src = t_full[self.dim_range[0] * core_tensor.coupling_width .. self.dim_range[1] * core_tensor.coupling_width];
+        @memcpy(self.s_weight.data, s_src);
+        @memcpy(self.t_weight.data, t_src);
+        _ = width;
+    }
+
+    /// Adds this shard's accumulated gradients into a full-width `[dim, 2]`
+    /// destination pair, which is what `RSF.accumulateLayerGradients` consumes.
+    pub fn exportGrads(self: *const Self, s_out: []f32, t_out: []f32) !void {
+        const required = self.dim_range[1] * core_tensor.coupling_width;
+        if (s_out.len < required or t_out.len < required) return error.InvalidShardRange;
+        if (self.s_grad) |g| {
+            @memcpy(s_out[self.dim_range[0] * core_tensor.coupling_width .. self.dim_range[1] * core_tensor.coupling_width], g.data);
+        }
+        if (self.t_grad) |g| {
+            @memcpy(t_out[self.dim_range[0] * core_tensor.coupling_width .. self.dim_range[1] * core_tensor.coupling_width], g.data);
+        }
+    }
+};
+
+/// The diffusion-aligned partition of a coupling layer across the core grid.
+///
+/// Partition rule (Section 4.10 item 2): with diffusion enabled and more than
+/// one core, `s = dim / c'` where `c'` is the largest divisor of `dim` with
+/// `c' ≤ cores` such that `s` is a power of two and `s ≤ block/2`. Cores
+/// `c' … cores−1` stay idle for that layer and are counted in
+/// `RPGUStatistics.diffusion_idle_cores`. With that choice every core interval
+/// lies inside a single diffusion block, so `log2(s)` butterfly stages are
+/// core-local while `stages − log2(s)` stages cross cores.
+pub const RSFPartition = struct {
+    dim: usize,
+    cores: usize,
+    active_cores: usize,
+    idle_cores: usize,
+    shard_len: usize,
+    diffusion: bool,
+    layout: core_types.RSFDiffusionLayout,
+    local_stages: usize,
+    cross_stages: usize,
+    /// Exchange rounds per layer: one per crossing butterfly stage plus one
+    /// `Q_r` reduce round plus one `Q_r` broadcast round (the last two only
+    /// when `radix > 1` and the block owners differ).
+    exchange_rounds_per_layer: usize,
+
+    /// Coupling index → owning core.
+    pub fn coreOf(self: RSFPartition, d: usize) usize {
+        if (self.shard_len == 0) return 0;
+        const owner = d / self.shard_len;
+        return if (owner < self.active_cores) owner else owner % self.active_cores;
+    }
+
+    /// Row coordinate → owning core. The even half occupies `[0, dim)` and the
+    /// odd half `[dim, 2·dim)`; both map onto the same coupling index.
+    pub fn coreOfRowIndex(self: RSFPartition, dim: usize, p: usize) usize {
+        const d = if (p < dim) p else p - dim;
+        return self.coreOf(d);
+    }
+};
+
+/// Computes the diffusion-aligned partition for `dim` over `cores`.
+pub fn planRSFPartition(dim: usize, cores: usize, diffusion: bool) !RSFPartition {
+    if (dim == 0 or cores == 0) return error.InvalidShardRange;
+    const layout = core_types.rsfDiffusionLayout(dim * 2) orelse return error.InvalidDiffusionLayout;
+
+    if (!diffusion) {
+        // Pre-upgrade contiguous split: no diffusion factor, so no exchange.
+        const shard_len = (dim + cores - 1) / cores;
+        const active = (dim + shard_len - 1) / shard_len;
+        return .{
+            .dim = dim,
+            .cores = cores,
+            .active_cores = active,
+            .idle_cores = cores - active,
+            .shard_len = shard_len,
+            .diffusion = false,
+            .layout = layout,
+            .local_stages = 0,
+            .cross_stages = 0,
+            .exchange_rounds_per_layer = 0,
+        };
+    }
+
+    if (cores == 1) {
+        return .{
+            .dim = dim,
+            .cores = cores,
+            .active_cores = 1,
+            .idle_cores = 0,
+            .shard_len = dim,
+            .diffusion = true,
+            .layout = layout,
+            .local_stages = layout.stages,
+            .cross_stages = 0,
+            .exchange_rounds_per_layer = 0,
+        };
+    }
+
+    // Largest divisor c' of dim with c' <= cores, dim/c' a power of two, and
+    // dim/c' <= block/2.
+    const half_block = layout.block / 2;
+    var chosen: usize = 0;
+    var candidate: usize = @min(cores, dim);
+    while (candidate >= 1) : (candidate -= 1) {
+        if (dim % candidate != 0) continue;
+        const s = dim / candidate;
+        if (s == 0 or (s & (s - 1)) != 0) continue;
+        if (s > half_block) continue;
+        chosen = candidate;
+        break;
+    }
+    if (chosen == 0) {
+        // No admissible split: one core performs the whole diffusion locally.
+        chosen = 1;
+    }
+    const shard_len = dim / chosen;
+    var local: usize = 0;
+    var probe = shard_len;
+    while (probe > 1) {
+        probe /= 2;
+        local += 1;
+    }
+    const cross = if (layout.stages > local) layout.stages - local else 0;
+    const q_rounds: usize = if (layout.radix > 1) 2 else 0;
+    return .{
+        .dim = dim,
+        .cores = cores,
+        .active_cores = chosen,
+        .idle_cores = cores - chosen,
+        .shard_len = shard_len,
+        .diffusion = true,
+        .layout = layout,
+        .local_stages = local,
+        .cross_stages = cross,
+        .exchange_rounds_per_layer = cross + q_rounds,
+    };
+}
+
+/// The measured outcome of a sharded midpoint collision.
+pub const RSFMidpointShardResult = struct {
+    z: rsf_mod.RSFLatentState,
+    w: rsf_mod.RSFLatentState,
+    collision_loss: f32,
+    logdet_forward: f32,
+    logdet_backward: f32,
+    logdet_total: f32,
+    forward_layers: usize,
+    backward_layers: usize,
+    /// Core counts assigned to the forward and backward frontiers. The two
+    /// groups are disjoint.
+    frontier_cores: [2]usize,
+    /// Measured number of inter-core exchanges performed during the collision.
+    exchanges: usize,
+
+    pub fn deinit(self: *RSFMidpointShardResult) void {
+        self.z.deinit();
+        self.w.deinit();
+        self.collision_loss = 0.0;
+        self.logdet_forward = 0.0;
+        self.logdet_backward = 0.0;
+        self.logdet_total = 0.0;
+        self.forward_layers = 0;
+        self.backward_layers = 0;
+        self.frontier_cores = .{ 0, 0 };
+        self.exchanges = 0;
+    }
+};
+
+/// The live RSF distribution recorded on the fabric.
+pub const RSFDistribution = struct {
+    model_id: u64,
+    dim: usize,
+    layer_count: usize,
+    partition: RSFPartition,
+    populated: bool,
+};
+
+/// Shape of an `RSFLatentState`: `[batch, dim, 2]`.
+const LatentShape = struct {
+    batch: usize,
+    dim: usize,
+};
+
+fn latentShape(state: *const RSFLatentState) !LatentShape {
+    const dims = state.data.shape.dims;
+    if (dims.len != 3) return error.LatentShapeMismatch;
+    return .{ .batch = dims[0], .dim = dims[1] };
+}
+
+/// Converts the interleaved `[batch, dim, 2]` latent storage into the blocked
+/// `[batch, 2·dim]` row layout every sharded kernel operates on.
+fn latentToBlocked(state: *const RSFLatentState, out: []f32) !void {
+    const shape = try latentShape(state);
+    const dim2 = shape.dim * 2;
+    if (out.len < shape.batch * dim2) return error.LatentShapeMismatch;
+    for (0..shape.batch) |b| {
+        for (0..shape.dim) |d| {
+            const src = (b * shape.dim + d) * 2;
+            out[b * dim2 + d] = state.data.data[src];
+            out[b * dim2 + shape.dim + d] = state.data.data[src + 1];
+        }
+    }
+}
+
+/// Inverse of `latentToBlocked`.
+fn blockedToLatent(rows: []const f32, state: *RSFLatentState) !void {
+    const shape = try latentShape(state);
+    const dim2 = shape.dim * 2;
+    if (rows.len < shape.batch * dim2) return error.LatentShapeMismatch;
+    for (0..shape.batch) |b| {
+        for (0..shape.dim) |d| {
+            const dst = (b * shape.dim + d) * 2;
+            state.data.data[dst] = rows[b * dim2 + d];
+            state.data.data[dst + 1] = rows[b * dim2 + shape.dim + d];
+        }
+    }
+}
+
+/// OFTB rotation `R` restricted to the coupling range `[a, b)`. The rotation
+/// acts inside the coordinate pair `(x1[d], x2[d])`, so it is core-local.
+fn rotationForwardRange(row: []f32, dim: usize, a: usize, b: usize) !void {
+    if (row.len < dim * 2) return error.LatentShapeMismatch;
+    const scale = 0.7071067811865476;
+    for (a..b) |d| {
+        const x1 = row[d];
+        const x2 = row[dim + d];
+        row[d] = (x1 - x2) * scale;
+        row[dim + d] = (x1 + x2) * scale;
+    }
+}
+
+/// OFTB adjoint rotation `Rᵀ = R⁻¹` restricted to `[a, b)`.
+fn rotationInverseRange(row: []f32, dim: usize, a: usize, b: usize) !void {
+    if (row.len < dim * 2) return error.LatentShapeMismatch;
+    const scale = 0.7071067811865476;
+    for (a..b) |d| {
+        const g1 = row[d];
+        const g2 = row[dim + d];
+        row[d] = (g1 + g2) * scale;
+        row[dim + d] = (g2 - g1) * scale;
+    }
+}
+
+fn rotationForwardSequenceRange(rows: []f32, dim: usize, seq_len: usize, a: usize, b: usize) !void {
+    for (0..seq_len) |t| {
+        try rotationForwardRange(rows[t * dim * 2 ..][0 .. dim * 2], dim, a, b);
+    }
+}
+
+fn rotationInverseSequenceRange(rows: []f32, dim: usize, seq_len: usize, a: usize, b: usize) !void {
+    for (0..seq_len) |t| {
+        try rotationInverseRange(rows[t * dim * 2 ..][0 .. dim * 2], dim, a, b);
+    }
+}
+
+/// Global diffusion `Θ = Q_r ⊗ H_{2^k}` executed across the shard partition.
+///
+/// The butterfly arithmetic is term-for-term identical to
+/// `tensor.hadamardBlockInPlace` (same stage order, same pairing, same
+/// `inv_sqrt2`), so the sharded result is bit-identical to the monolithic CPU
+/// kernel while every pair whose two lanes live on different cores is counted
+/// as a real `rsf_diffuse_exchange`, and every `Q_r` contribution that has to
+/// be reduced from a remote block owner is counted as a `rsf_diffuse_sum` plus
+/// a `rsf_diffuse_broadcast`.
+fn diffuseRowSharded(
+    row: []f32,
+    partition: RSFPartition,
+    fabric: *RelationalGraphProcessingUnit,
+) !void {
+    const layout = partition.layout;
+    if (row.len != layout.row_len) return error.LatentShapeMismatch;
+    const dim = partition.dim;
+    const scratch = try fabric.allocator.alloc(f32, layout.block);
+    defer fabric.allocator.free(scratch);
+
+    var h: usize = 1;
+    var stage: usize = 0;
+    while (stage < layout.stages) : ({
+        stage += 1;
+        h *= 2;
+    }) {
+        var block_base: usize = 0;
+        while (block_base < layout.row_len) : (block_base += layout.block) {
+            var base: usize = 0;
+            while (base < layout.block) : (base += 2 * h) {
+                for (0..h) |k| {
+                    const pi = block_base + base + k;
+                    const qi = pi + h;
+                    if (partition.coreOfRowIndex(dim, pi) != partition.coreOfRowIndex(dim, qi)) {
+                        fabric.diffusion_exchanges += 1;
+                    }
+                    const u = row[pi];
+                    const v = row[qi];
+                    row[pi] = (u + v) * rsf_inv_sqrt2;
+                    row[qi] = (u - v) * rsf_inv_sqrt2;
+                }
+            }
+        }
+        fabric.diffusion_cycles += layout.row_len / 2;
+    }
+
+    if (layout.radix <= 1) return;
+    @memset(scratch, 0.0);
+    var bi: usize = 0;
+    while (bi < layout.radix) : (bi += 1) {
+        const base = bi * layout.block;
+        for (0..layout.block) |o| {
+            if (bi > 0 and partition.coreOfRowIndex(dim, base + o) != partition.coreOfRowIndex(dim, o)) {
+                fabric.diffusion_exchanges += 2;
+            }
+            scratch[o] += row[base + o];
+        }
+    }
+    const factor: f32 = @floatCast(2.0 / @as(f64, @floatFromInt(layout.radix)));
+    bi = 0;
+    while (bi < layout.radix) : (bi += 1) {
+        const base = bi * layout.block;
+        for (0..layout.block) |o| row[base + o] -= factor * scratch[o];
+    }
+    fabric.diffusion_cycles += layout.radix * layout.block;
+}
+
+/// Records the per-channel saturation census of one shard: `pre_s` reaching a
+/// clip bound marks the channel inactive for the scatter-flow mask. Measured
+/// from the clip window on the rows just flowed, never assumed.
+fn recordSaturationCensus(
+    shard: *Shard,
+    params: core_tensor.RSFCouplingParams,
+    rows: []const f32,
+    shape: LatentShape,
+) !usize {
+    const dim2 = shape.dim * 2;
+    if (shard.saturated_flags.len < params.dim) return error.InvalidShardRange;
+    @memset(shard.saturated_flags, false);
+    for (0..shape.batch) |r| {
+        const row = rows[r * dim2 ..][0..dim2];
+        for (0..params.dim) |d| {
+            const raw = params.scaleWeight(d) * row[shape.dim + d] + params.scaleBias(d);
+            if (core_tensor.couplingSaturates(raw, params.clip_min, params.clip_max)) {
+                shard.saturated_flags[d] = true;
+            }
+        }
+    }
+    var unsaturated: usize = 0;
+    for (shard.saturated_flags) |f| {
+        if (!f) unsaturated += 1;
+    }
+    shard.active_channels = unsaturated;
+    return unsaturated;
+}
+
+/// Causal cross-token coupling (Section 4.8) restricted to the channel range
+/// `[a, b)`. The prefix accumulation is per-channel, hence entirely core-local.
+fn causalForwardRange(
+    rows: []f32,
+    dim: usize,
+    a: usize,
+    b: usize,
+    s_weight: []const f32,
+    t_weight: []const f32,
+    mask: *const core_types.RSFSequenceMask,
+    scratch_k: []f32,
+    scratch_x2: []f32,
+    scale: []f32,
+    trans: []f32,
+) !f32 {
+    const width = b - a;
+    const params = try core_tensor.RSFCouplingParams.init(
+        s_weight,
+        t_weight,
+        width,
+        core_tensor.rsf_default_clip_min,
+        core_tensor.rsf_default_clip_max,
+    );
+    if (scratch_k.len < mask.seq_len * width) return error.LatentShapeMismatch;
+
+    // K_t = Σ_{t' < t} C[t,t'] · X_2,t' — per channel, hence core-local.
+    for (0..mask.seq_len) |t| {
+        const slot = scratch_k[t * width ..][0..width];
+        @memset(slot, 0.0);
+        var j: usize = 0;
+        while (j < t) : (j += 1) {
+            if (!mask.get(t, j)) continue;
+            const src = j * dim * 2 + dim + a;
+            for (0..width) |i| slot[i] += rows[src + i];
+        }
+    }
+
+    var logdet: f32 = 0.0;
+    for (0..mask.seq_len) |t| {
+        const base = t * dim * 2;
+        const key = scratch_k[t * width ..][0..width];
+        for (0..width) |i| {
+            const raw = params.scaleWeight(i) * key[i] + params.scaleBias(i);
+            const clipped = core_tensor.clipCoupling(raw, params.clip_min, params.clip_max);
+            scale[i] = @exp(clipped);
+            logdet += clipped;
+        }
+        for (0..width) |i| rows[base + a + i] *= scale[i];
+        for (0..width) |i| trans[i] = params.translationWeight(i) * rows[base + a + i] + params.translationBias(i);
+        for (0..width) |i| rows[base + dim + a + i] += trans[i];
+    }
+    _ = scratch_x2;
+    return logdet;
+}
+
+/// Exact three-step inverse of `causalForwardRange`: recover `X_2`, re-evaluate
+/// `K`, then `X_1 = Y_1·e^{−s}`.
+fn causalInverseRange(
+    rows: []f32,
+    dim: usize,
+    a: usize,
+    b: usize,
+    s_weight: []const f32,
+    t_weight: []const f32,
+    mask: *const core_types.RSFSequenceMask,
+    scratch_k: []f32,
+    scratch_x2: []f32,
+    scale: []f32,
+    trans: []f32,
+) !f32 {
+    const width = b - a;
+    const params = try core_tensor.RSFCouplingParams.init(
+        s_weight,
+        t_weight,
+        width,
+        core_tensor.rsf_default_clip_min,
+        core_tensor.rsf_default_clip_max,
+    );
+    // Step 1: recover X_2 from Y (no K needed).
+    for (0..mask.seq_len) |t| {
+        const base = t * dim * 2;
+        for (0..width) |i| {
+            trans[i] = params.translationWeight(i) * rows[base + a + i] + params.translationBias(i);
+        }
+        for (0..width) |i| {
+            const x2 = rows[base + dim + a + i] - trans[i];
+            scratch_x2[t * width + i] = x2;
+            rows[base + dim + a + i] = x2;
+        }
+    }
+    // Step 2: re-evaluate K from the recovered X_2 and recompute s.
+    var logdet: f32 = 0.0;
+    for (0..mask.seq_len) |t| {
+        for (0..width) |i| scratch_k[i] = 0.0;
+        var j: usize = 0;
+        while (j < t) : (j += 1) {
+            if (!mask.get(t, j)) continue;
+            for (0..width) |i| scratch_k[i] += scratch_x2[j * width + i];
+        }
+        for (0..width) |i| {
+            const raw = params.scaleWeight(i) * scratch_k[i] + params.scaleBias(i);
+            const clipped = core_tensor.clipCoupling(raw, params.clip_min, params.clip_max);
+            scale[i] = clipped;
+            logdet += clipped;
+        }
+        // Step 3: X_1 = Y_1 · exp(−s).
+        const base = t * dim * 2;
+        for (0..width) |i| {
+            rows[base + a + i] *= @exp(-scale[i]);
+        }
+    }
+    return logdet;
+}
+
+/// One shard's coupling forward over every row; returns the summed log-det.
+fn shardCouplingForward(
+    shard: *Shard,
+    rows: []f32,
+    shape: LatentShape,
+    scale: []f32,
+    trans: []f32,
+) !f64 {
+    const a = shard.dim_range[0];
+    const b = shard.dim_range[1];
+    const params = try core_tensor.RSFCouplingParams.init(
+        shard.s_weight.data,
+        shard.t_weight.data,
+        b - a,
+        core_tensor.rsf_default_clip_min,
+        core_tensor.rsf_default_clip_max,
+    );
+    var logdet: f64 = 0.0;
+    for (0..shape.batch) |r| {
+        const row = rows[r * shape.dim * 2 ..][0 .. shape.dim * 2];
+        logdet += try core_tensor.couplingForwardHalves(
+            params,
+            row[a..b],
+            row[shape.dim + a .. shape.dim + b],
+            scale[a..b],
+            trans[a..b],
+        );
+        try rotationForwardRange(row, shape.dim, a, b);
+    }
+    shard.logdet_contribution = logdet;
+    return logdet;
+}
+
+/// One shard's exact coupling inverse over every row, plus the rotation
+/// adjoint, in the order `Θ → Rᵀ → C⁻¹`.
+fn shardCouplingInverse(
+    shard: *Shard,
+    rows: []f32,
+    shape: LatentShape,
+    scale: []f32,
+    trans: []f32,
+) !f64 {
+    const a = shard.dim_range[0];
+    const b = shard.dim_range[1];
+    const params = try core_tensor.RSFCouplingParams.init(
+        shard.s_weight.data,
+        shard.t_weight.data,
+        b - a,
+        core_tensor.rsf_default_clip_min,
+        core_tensor.rsf_default_clip_max,
+    );
+    var logdet: f64 = 0.0;
+    for (0..shape.batch) |r| {
+        const row = rows[r * shape.dim * 2 ..][0 .. shape.dim * 2];
+        try rotationInverseRange(row, shape.dim, a, b);
+        logdet += try core_tensor.couplingInverseHalves(
+            params,
+            row[a..b],
+            row[shape.dim + a .. shape.dim + b],
+            scale[a..b],
+            trans[a..b],
+        );
+    }
+    shard.logdet_contribution = logdet;
+    return logdet;
+}

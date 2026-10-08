@@ -6,3 +6,5 @@ pub const sfd = @import("optimizer/sfd.zig");
 pub const ssi = @import("index/ssi.zig");
 pub const ranker = @import("ranker/ranker.zig");
 pub const nsir_core = @import("core_relational/nsir_core.zig");
+pub const vpu = @import("core_relational/vpu.zig");
+pub const r_gpu = @import("core_relational/r_gpu.zig");

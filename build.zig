@@ -195,6 +195,38 @@ pub fn build(b: *std.Build) void {
     const test_rsf_step = b.step("test-rsf", "Run the RSF tensor, causal, and spectral substrate tests");
     test_rsf_step.dependOn(&run_rsf_substrate_tests.step);
 
+    const rsf_native_tests = b.addTest(.{
+        .name = "rsf-native-tests",
+        .root_source_file = b.path("src/tests/rsf_native_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rsf_native_tests.linkLibC();
+    rsf_native_tests.root_module.addOptions("build_options", build_options);
+    rsf_native_tests.root_module.addImport("jaide", jaide_mod);
+    const run_rsf_native_tests = b.addRunArtifact(rsf_native_tests);
+    const test_rsf_native_step = b.step("test-rsf-native", "Run the accel-free RSF-native cross-module invariant suite");
+    test_rsf_native_step.dependOn(&run_rsf_native_tests.step);
+
+    // The accel-backed half of the invariant suite. Its import closure reaches
+    // `src/hw/accel/accel_interface.zig`, whose `pub extern "c" fn futhark_*`
+    // declarations are called from its destructors, so this artifact needs the
+    // Futhark-generated C to link. It is registered WITHOUT the Futhark
+    // codegen step so the failure surfaces as a link error rather than a
+    // missing-tool error, and it is reported as blocked when that happens.
+    const rsf_native_accel_tests = b.addTest(.{
+        .name = "rsf-native-accel-tests",
+        .root_source_file = b.path("src/tests/rsf_native_accel_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rsf_native_accel_tests.linkLibC();
+    rsf_native_accel_tests.root_module.addOptions("build_options", build_options);
+    rsf_native_accel_tests.root_module.addImport("jaide", jaide_mod);
+    const run_rsf_native_accel_tests = b.addRunArtifact(rsf_native_accel_tests);
+    const test_rsf_native_accel_step = b.step("test-rsf-native-accel", "Run the accelerator-backed RSF-native invariants (needs the Futhark-generated C)");
+    test_rsf_native_accel_step.dependOn(&run_rsf_native_accel_tests.step);
+
     if (rtl_enabled) {
         const clash_step = b.addSystemCommand(&.{clash_bin});
         clash_step.addArg("--verilog");

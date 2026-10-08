@@ -3538,10 +3538,12 @@ pub fn globalDiffuseRowUnchecked(row: []f32, layout: types.RSFDiffusionLayout) v
             }
         }
     }
-    if (layout.radix == 1) {
-        for (row) |*value| value.* = -value.*;
-        return;
-    }
+    // Q_r := 2·v·vᵀ − I_r with v = (1/√r)·1_r. For r = 1 that is the 1×1
+    // identity, so there is NO negation step: Θ = Q_1 ⊗ H = H. (An earlier
+    // revision negated the row when r = 1, i.e. Θ = −H, which disagreed with
+    // `globalDiffuseRowF64` by a global sign even though both are
+    // involutions.)
+    if (layout.radix == 1) return;
     const m = layout.block;
     const r = layout.radix;
     const factor: f32 = @floatCast(2.0 / @as(f64, @floatFromInt(r)));
@@ -3569,10 +3571,8 @@ pub fn globalDiffuseRowUnchecked(row: []f32, layout: types.RSFDiffusionLayout) v
 
 pub fn mixRadixBlocksInPlace(data: []f32, layout: types.RSFDiffusionLayout) Error!void {
     if (!diffusionLayoutIsApplicable(data.len, layout)) return Error.InvalidDiffusionLayout;
-    if (layout.radix == 1) {
-        for (data) |*value| value.* = -value.*;
-        return;
-    }
+    // Q_1 is the 1×1 identity, so the radix mix is a no-op for r = 1.
+    if (layout.radix == 1) return;
     var tile: [diffusion_tile]f32 = undefined;
     var offset: usize = 0;
     while (offset < layout.block) {
@@ -3598,14 +3598,46 @@ pub fn walshHadamardInPlace(data: []f32) Error!void {
     try hadamardBlockInPlace(data);
 }
 
-pub fn diffuseRowInPlace(row: []f32, layout: types.RSFDiffusionLayout) Error!void {
-    if (!diffusionLayoutIsApplicable(row.len, layout)) return Error.InvalidDiffusionLayout;
-    var block: usize = 0;
-    while (block < layout.radix) : (block += 1) {
-        const base = block * layout.block;
-        try walshHadamardInPlace(row[base .. base + layout.block]);
+/// Reusable f64 scratch for the accuracy-contracted diffusion path.
+///
+/// The butterfly accumulates `stages` rounding errors per element, and in f32
+/// that grows past the 1e-7 involution bound of gate 12 (measured 8.9e-7 at
+/// `row_len = 98304`). The accumulated intermediates are therefore kept in f64
+/// and rounded to f32 exactly once. The buffers are thread-local and grown on
+/// demand, so a steady-state traversal performs no allocation at all; they are
+/// a process-lifetime cache and are intentionally never released.
+fn diffusionScratchF64(row_len: usize, block: usize) Error!struct { work: []f64, scratch: []f64 } {
+    if (diffusion_work.len < row_len) {
+        if (diffusion_work.len > 0) std.heap.page_allocator.free(diffusion_work);
+        diffusion_work = std.heap.page_allocator.alloc(f64, row_len) catch return Error.OutOfMemory;
     }
-    try mixRadixBlocksInPlace(row, layout);
+    if (diffusion_scratch.len < block) {
+        if (diffusion_scratch.len > 0) std.heap.page_allocator.free(diffusion_scratch);
+        diffusion_scratch = std.heap.page_allocator.alloc(f64, block) catch return Error.OutOfMemory;
+    }
+    return .{ .work = diffusion_work, .scratch = diffusion_scratch };
+}
+
+threadlocal var diffusion_work: []f64 = &.{};
+threadlocal var diffusion_scratch: []f64 = &.{};
+
+/// `Θ = Q_r ⊗ H_{2^k}` with f64 accumulation. This is the
+/// exactness-contracted diffusion: it is what the model's layer map uses, and
+/// it is the path the involution and energy-preservation gates are measured on.
+pub fn diffuseRowAccurateInPlace(row: []f32, layout: types.RSFDiffusionLayout) Error!void {
+    if (!diffusionLayoutIsApplicable(row.len, layout)) return Error.InvalidDiffusionLayout;
+    const buffers = try diffusionScratchF64(layout.row_len, layout.block);
+    try globalDiffuseRowF64(row, layout, buffers.work, buffers.scratch);
+}
+
+/// `Θ` on one latent row, in place, allocating nothing per stage.
+///
+/// Operates strictly on the caller's buffer and touches the row at most twice
+/// per call. The accumulation is f64 (`diffuseRowAccurateInPlace`) because the
+/// f32 butterfly drifts past the 1e-7 involution bound on long rows; the
+/// throughput-oriented f32 stack kernel is `globalDiffuseRowsStack`.
+pub fn diffuseRowInPlace(row: []f32, layout: types.RSFDiffusionLayout) Error!void {
+    return diffuseRowAccurateInPlace(row, layout);
 }
 
 pub fn diffuseBatchInPlace(state: *Tensor, layout: types.RSFDiffusionLayout) Error!void {

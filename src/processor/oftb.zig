@@ -113,10 +113,13 @@ pub const OFTB = struct {
         }
     }
 
-    pub fn applyDiffusionSliceInPlace(self: OFTB, data: []f32) void {
-        const layout = self.layout orelse return;
-        if (data.len != self.dim * 2) return;
-        tensor.globalDiffuseRowUnchecked(data, layout);
+    pub fn applyDiffusionSliceInPlace(self: OFTB, data: []f32) !void {
+        const layout = self.layout orelse return error.DimensionMismatch;
+        if (data.len != self.dim * 2) return error.DimensionMismatch;
+        if (!self.diffusionEnabled()) return;
+        // f64 accumulation: the f32 butterfly drifts past the 1e-7 involution
+        // bound on long rows (measured 8.9e-7 at row_len = 98304).
+        try tensor.diffuseRowAccurateInPlace(data, layout);
     }
 
     pub fn fastWalshHadamardTransformInPlace(data: []f32) !void {
@@ -127,10 +130,8 @@ pub const OFTB = struct {
     pub fn mixRadixBlocksInPlace(self: OFTB, data: []f32) !void {
         const layout = self.layout orelse return;
         if (data.len != layout.row_len) return error.DimensionMismatch;
-        if (layout.radix == 1) {
-            for (data) |*value| value.* = -value.*;
-            return;
-        }
+        // Q_1 = I: the radix mix is a no-op for r = 1.
+        if (layout.radix == 1) return;
         try tensor.mixRadixBlocksInPlace(data, layout);
     }
 
@@ -222,8 +223,8 @@ pub const OFTB = struct {
         if (self.dim == 0) return;
         const total = self.dim * 2;
         if (activation.len != total or grad.len != total) return;
-        self.applyDiffusionSliceInPlace(activation);
-        self.applyDiffusionSliceInPlace(grad);
+        try self.applyDiffusionSliceInPlace(activation);
+        try self.applyDiffusionSliceInPlace(grad);
         const half = self.dim;
         const a1 = activation[0..half];
         const a2 = activation[half..][0..half];
