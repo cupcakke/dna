@@ -1,5 +1,6 @@
 const std = @import("std");
 const nsir_core = @import("nsir_core.zig");
+const rsf_mod = @import("../processor/rsf.zig");
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const Complex = std.math.Complex;
@@ -11,6 +12,13 @@ pub const SelfSimilarRelationalGraph = nsir_core.SelfSimilarRelationalGraph;
 pub const Node = nsir_core.Node;
 pub const Edge = nsir_core.Edge;
 pub const EdgeQuality = nsir_core.EdgeQuality;
+
+/// The RSF substrate the VPU executes. Re-exported so the VPU is constructed
+/// and driven natively through RSF handles only: every coupling entry point in
+/// this file takes an `*const RSF` / `*RSF` or a tensor bound to one.
+pub const RSF = rsf_mod.RSF;
+pub const RSFLatentState = rsf_mod.RSFLatentState;
+pub const RSFBranch = rsf_mod.RSFBranch;
 
 pub const tma_buffer_alignment: usize = 128;
 pub const bitmask_row_alignment_words: usize = tma_buffer_alignment / @sizeOf(u64);
@@ -895,6 +903,14 @@ pub const VectorBatch = struct {
                     },
                     else => return err,
                 },
+                // The RSF coupling variants never reach the arithmetic vector
+                // batch: `VPU.processVectors` routes them to the coupling batch
+                // before this point. They are listed explicitly so the switch
+                // stays exhaustive and a future variant cannot be dropped.
+                .coupling_forward, .coupling_inverse, .coupling_adjoint, .coupling_diffuse, .coupling_causal_forward => {
+                    skip_count += 1;
+                    continue;
+                },
             }
             success_count += 1;
         }
@@ -1070,11 +1086,318 @@ pub const VectorBatch = struct {
     }
 };
 
+/// A validated, borrowed view of one RSF coupling layer's parameters.
+///
+/// Every field is checked by `validate` before the lanes are driven: the two
+/// parameter tensors must carry `.layer_weight_s` / `.layer_weight_t` bindings
+/// belonging to the *same* model and layer, with matching `dim`. An unbound or
+/// misbound tensor is rejected with the typed `types.RSFBindingError`, never
+/// silently coerced. `mask` selects the causal cross-token coupling mode of
+/// Section 4.8 when non-null; the per-token row coupling is used otherwise.
+pub const CouplingParamsRef = struct {
+    model_id: u64,
+    layer_index: usize,
+    dim: usize,
+    s_weight: *const core_tensor.Tensor,
+    t_weight: *const core_tensor.Tensor,
+    clip_min: f32 = core_tensor.rsf_default_clip_min,
+    clip_max: f32 = core_tensor.rsf_default_clip_max,
+    diffusion: bool = false,
+    mask: ?*const core_types.RSFSequenceMask = null,
+
+    const Self = @This();
+
+    pub fn validate(self: Self) core_types.RSFBindingError!void {
+        const s_binding = self.s_weight.binding() orelse return core_types.RSFBindingError.RSFBindingRequired;
+        const t_binding = self.t_weight.binding() orelse return core_types.RSFBindingError.RSFBindingRequired;
+        try s_binding.requireSpace(.layer_weight_s);
+        try t_binding.requireSpace(.layer_weight_t);
+        try s_binding.requireDim(self.dim);
+        try t_binding.requireDim(self.dim);
+        if (self.model_id != 0) {
+            try s_binding.requireModel(self.model_id);
+            try t_binding.requireModel(self.model_id);
+        }
+        try s_binding.requireLayer(self.layer_index);
+        try t_binding.requireLayer(self.layer_index);
+        const required = self.dim * core_tensor.coupling_width;
+        if (self.s_weight.data.len < required) return core_types.RSFBindingError.RSFDimMismatch;
+        if (self.t_weight.data.len < required) return core_types.RSFBindingError.RSFDimMismatch;
+    }
+
+    /// Builds the canonical parameter view consumed by the `tensor.zig`
+    /// kernels. `validate` must have succeeded; it is re-run here so a params
+    /// view can never be formed from misbound storage.
+    pub fn params(self: Self) core_types.Error!core_tensor.RSFCouplingParams {
+        self.validate() catch return core_types.Error.InvalidArgument;
+        return core_tensor.RSFCouplingParams.init(
+            self.s_weight.data,
+            self.t_weight.data,
+            self.dim,
+            self.clip_min,
+            self.clip_max,
+        );
+    }
+
+    pub fn diffusionLayout(self: Self) ?core_types.RSFDiffusionLayout {
+        return core_types.rsfDiffusionLayout(self.dim * 2);
+    }
+};
+
+/// A batch of RSF coupling rows held as one contiguous `[count, 2*dim]` slab
+/// plus the binding that records which model/layer produced it. This is the
+/// "batches of coupling lanes plus their bindings" storage of Phase 9: the
+/// existing arithmetic `VectorBatch` is left untouched for the quantum/LNS
+/// utilities that consume it.
+pub const CouplingBatch = struct {
+    rows: ArrayList(f32),
+    count: usize,
+    dim: usize,
+    binding: core_types.RSFBinding,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, dim: usize, binding: core_types.RSFBinding) Self {
+        return .{
+            .rows = ArrayList(f32).init(allocator),
+            .count = 0,
+            .dim = dim,
+            .binding = binding,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rows.deinit();
+        self.count = 0;
+        self.dim = 0;
+    }
+
+    pub fn reset(self: *Self) void {
+        self.rows.clearRetainingCapacity();
+        self.count = 0;
+    }
+
+    pub fn rowLen(self: Self) usize {
+        return self.dim * 2;
+    }
+
+    pub fn addRow(self: *Self, values: []const f32) !usize {
+        if (values.len != self.rowLen()) return error.StateShapeMismatch;
+        try self.rows.appendSlice(values);
+        self.count += 1;
+        return self.count - 1;
+    }
+
+    pub fn row(self: *Self, index: usize) ![]f32 {
+        if (index >= self.count) return error.OutOfBounds;
+        const len = self.rowLen();
+        return self.rows.items[index * len ..][0..len];
+    }
+
+    pub fn rowConst(self: *const Self, index: usize) ![]const f32 {
+        if (index >= self.count) return error.OutOfBounds;
+        const len = self.rowLen();
+        return self.rows.items[index * len ..][0..len];
+    }
+
+    /// Applies the canonical coupling forward to every row. Returns the summed
+    /// `Σ_d c[d]` log-det over the batch (f64 accumulation, cast once).
+    pub fn forward(self: *Self, params: CouplingParamsRef, scale: []f32, trans: []f32) !f64 {
+        try params.validate();
+        if (params.dim != self.dim) return core_types.RSFBindingError.RSFDimMismatch;
+        const p = try params.params();
+        const logdet = try core_tensor.couplingForwardRows(p, self.rows.items, self.count, scale, trans);
+        if (params.diffusion) {
+            const layout = params.diffusionLayout() orelse return error.ZeroDimension;
+            try core_tensor.globalDiffuseRowsStack(self.rows.items, self.count, layout);
+        }
+        return logdet;
+    }
+
+    /// Applies the exact coupling inverse to every row, undoing the diffusion
+    /// factor first (Θ is its own inverse, so the order is the mirror image).
+    pub fn inverse(self: *Self, params: CouplingParamsRef, scale: []f32, trans: []f32) !f64 {
+        try params.validate();
+        if (params.dim != self.dim) return core_types.RSFBindingError.RSFDimMismatch;
+        const p = try params.params();
+        if (params.diffusion) {
+            const layout = params.diffusionLayout() orelse return error.ZeroDimension;
+            try core_tensor.globalDiffuseRowsStack(self.rows.items, self.count, layout);
+        }
+        return try core_tensor.couplingInverseRows(p, self.rows.items, self.count, scale, trans);
+    }
+
+    /// Applies the unparameterized global diffusion Θ to every row.
+    pub fn diffuse(self: *Self) !void {
+        if (self.count == 0) return;
+        const layout = core_types.rsfDiffusionLayout(self.rowLen()) orelse return error.ZeroDimension;
+        if (!core_tensor.diffusionLayoutIsApplicable(self.rowLen(), layout)) return error.StateShapeMismatch;
+        try core_tensor.globalDiffuseRowsStack(self.rows.items, self.count, layout);
+    }
+
+    /// Causal cross-token coupling over the whole batch (Section 4.8). The
+    /// batch is interpreted as `[sequences, seq_len, dim, 2]` flattened, so
+    /// `count` must be a whole multiple of `mask.seq_len`. Returns the summed
+    /// `Σ_t Σ_d s_{t,d}` log-det over every sequence.
+    pub fn causalForward(self: *Self, params: CouplingParamsRef, scratch: *CausalCouplingScratch) !f64 {
+        const mask = params.mask orelse return error.MaskRequired;
+        try params.validate();
+        if (params.dim != self.dim) return core_types.RSFBindingError.RSFDimMismatch;
+        try scratch.require(mask.seq_len, self.dim);
+        const p = try params.params();
+        const sequences = self.count / mask.seq_len;
+        var total: f64 = 0.0;
+        for (0..sequences) |s| {
+            const base = s * mask.seq_len * self.rowLen();
+            gatherHalves(self.rows.items[base .. base + mask.seq_len * self.rowLen()], mask.seq_len, self.dim, scratch.x1, scratch.x2);
+            total += try core_tensor.causalCouplingForward(
+                p,
+                mask.*,
+                scratch.x1,
+                scratch.x2,
+                scratch.x1,
+                scratch.x2,
+                scratch.key,
+                scratch.scale,
+                scratch.trans,
+            );
+            scatterHalves(scratch.x1, scratch.x2, mask.seq_len, self.dim, self.rows.items[base .. base + mask.seq_len * self.rowLen()]);
+        }
+        return total;
+    }
+
+    /// Exact inverse of `causalForward`, using the three-step procedure of
+    /// Section 4.8 (recover `X_2`, re-evaluate `K`, then `X_1 = Y_1·e^{−s}`).
+    pub fn causalInverse(self: *Self, params: CouplingParamsRef, scratch: *CausalCouplingScratch) !void {
+        const mask = params.mask orelse return error.MaskRequired;
+        try params.validate();
+        if (params.dim != self.dim) return core_types.RSFBindingError.RSFDimMismatch;
+        try scratch.require(mask.seq_len, self.dim);
+        const p = try params.params();
+        const sequences = self.count / mask.seq_len;
+        for (0..sequences) |s| {
+            const base = s * mask.seq_len * self.rowLen();
+            gatherHalves(self.rows.items[base .. base + mask.seq_len * self.rowLen()], mask.seq_len, self.dim, scratch.x1, scratch.x2);
+            _ = try core_tensor.causalCouplingInverse(
+                p,
+                mask.*,
+                scratch.x1,
+                scratch.x2,
+                scratch.x1,
+                scratch.x2,
+                scratch.key,
+                scratch.scale,
+                scratch.trans,
+            );
+            scatterHalves(scratch.x1, scratch.x2, mask.seq_len, self.dim, self.rows.items[base .. base + mask.seq_len * self.rowLen()]);
+        }
+    }
+};
+
+/// Reusable gather/scatter scratch for the causal coupling path. Allocated
+/// once per traversal and reused across layers and sequences, so the causal
+/// path never allocates in the layer loop.
+pub const CausalCouplingScratch = struct {
+    x1: []f32,
+    x2: []f32,
+    key: []f32,
+    scale: []f32,
+    trans: []f32,
+    seq_len: usize,
+    dim: usize,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, seq_len: usize, dim: usize) !Self {
+        return Self{
+            .x1 = try allocator.alloc(f32, seq_len * dim),
+            .x2 = try allocator.alloc(f32, seq_len * dim),
+            .key = try allocator.alloc(f32, dim),
+            .scale = try allocator.alloc(f32, dim),
+            .trans = try allocator.alloc(f32, dim),
+            .seq_len = seq_len,
+            .dim = dim,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.x1);
+        self.allocator.free(self.x2);
+        self.allocator.free(self.key);
+        self.allocator.free(self.scale);
+        self.allocator.free(self.trans);
+        self.x1 = &.{};
+        self.x2 = &.{};
+        self.key = &.{};
+        self.scale = &.{};
+        self.trans = &.{};
+        self.seq_len = 0;
+        self.dim = 0;
+    }
+
+    pub fn require(self: *Self, seq_len: usize, dim: usize) !void {
+        if (self.seq_len == seq_len and self.dim == dim) return;
+        if (self.seq_len != 0 or self.dim != 0) self.deinit();
+        self.* = try init(self.allocator, seq_len, dim);
+    }
+};
+
+/// Splits a `[seq_len, 2*dim]` row block into its contiguous even/odd planes.
+fn gatherHalves(rows: []const f32, seq_len: usize, dim: usize, x1: []f32, x2: []f32) void {
+    for (0..seq_len) |t| {
+        const base = t * 2 * dim;
+        @memcpy(x1[t * dim ..][0..dim], rows[base .. base + dim]);
+        @memcpy(x2[t * dim ..][0..dim], rows[base + dim .. base + 2 * dim]);
+    }
+}
+
+/// Cosine similarity between two single-row latent states, computed in f64
+/// over the interleaved `[dim, 2]` storage. Returns `0` for a zero vector
+/// rather than dividing by zero, and is used to re-weight relational edges
+/// from measured latent geometry.
+pub fn latentCosine(a: RSFLatentState, b: RSFLatentState) !f64 {
+    if (a.data.data.len != b.data.data.len) return error.StateShapeMismatch;
+    var dot: f64 = 0.0;
+    var na: f64 = 0.0;
+    var nb: f64 = 0.0;
+    for (a.data.data, b.data.data) |x, y| {
+        const xf: f64 = @floatCast(x);
+        const yf: f64 = @floatCast(y);
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+    }
+    const denom = @sqrt(na) * @sqrt(nb);
+    if (denom <= 1e-30) return 0.0;
+    return dot / denom;
+}
+
+/// Reassembles contiguous even/odd planes back into `[seq_len, 2*dim]` rows.
+fn scatterHalves(x1: []const f32, x2: []const f32, seq_len: usize, dim: usize, rows: []f32) void {
+    for (0..seq_len) |t| {
+        const base = t * 2 * dim;
+        @memcpy(rows[base .. base + dim], x1[t * dim ..][0..dim]);
+        @memcpy(rows[base + dim .. base + 2 * dim], x2[t * dim ..][0..dim]);
+    }
+}
+
 pub const BatchOperation = union(enum) {
     normalize: void,
     scale: f64,
     abs: void,
     sqrt: void,
+    /// RSF-native coupling operations. Each carries the validated parameter
+    /// reference; `processVectors` routes them to the coupling batch, never to
+    /// the arithmetic `VectorBatch`.
+    coupling_forward: CouplingParamsRef,
+    coupling_inverse: CouplingParamsRef,
+    coupling_adjoint: CouplingParamsRef,
+    coupling_diffuse: void,
+    coupling_causal_forward: CouplingParamsRef,
 };
 
 pub const Matrix4x4 = struct {
@@ -1949,6 +2272,17 @@ pub const VectorCache = struct {
 pub const VPU = struct {
     memory_pool: MemoryPool,
     vector_batch: VectorBatch,
+    /// RSF-native coupling lane batch. The arithmetic `vector_batch` above is
+    /// retained for the quantum/LNS/SIMD utility paths; every RSF coupling
+    /// operation in this facade runs through this batch instead.
+    coupling_batch: CouplingBatch,
+    /// Adjoint counterpart of `coupling_batch`: same geometry, holds the
+    /// incoming output gradient on entry and `∂L/∂x` on return.
+    gradient_batch: CouplingBatch,
+    /// Accumulated parameter gradients for the layer currently being executed,
+    /// each `[dim, 2]` in a layer `.gradient` tensor's layout.
+    parameterGradS: []f32,
+    parameterGradT: []f32,
     statistics: VPUStatistics,
     matrix_ops: MatrixOps,
     relational_ops: RelationalVectorOps,
@@ -1983,6 +2317,10 @@ pub const VPU = struct {
         return Self{
             .memory_pool = memory_pool,
             .vector_batch = vector_batch,
+            .coupling_batch = CouplingBatch.init(allocator, 0, core_types.RSFBinding.detached(.latent_state, 0)),
+            .gradient_batch = CouplingBatch.init(allocator, 0, core_types.RSFBinding.detached(.latent_state, 0)),
+            .parameterGradS = &.{},
+            .parameterGradT = &.{},
             .statistics = VPUStatistics.init(),
             .matrix_ops = matrix_ops,
             .relational_ops = relational_ops,
@@ -1996,13 +2334,349 @@ pub const VPU = struct {
     pub fn deinit(self: *Self) void {
         self.memory_pool.deinit();
         self.vector_batch.deinit();
+        self.coupling_batch.deinit();
+        self.gradient_batch.deinit();
+        if (self.parameterGradS.len > 0) self.allocator.free(self.parameterGradS);
+        if (self.parameterGradT.len > 0) self.allocator.free(self.parameterGradT);
+        self.parameterGradS = &.{};
+        self.parameterGradT = &.{};
         self.vector_cache.deinit();
     }
 
     pub fn processVectors(self: *Self, operation: BatchOperation) !void {
+        switch (operation) {
+            .coupling_forward, .coupling_inverse, .coupling_adjoint, .coupling_diffuse, .coupling_causal_forward => {
+                try self.processCouplingBatch(operation);
+                return;
+            },
+            else => {},
+        }
         const count_before = self.vector_batch.count();
         try self.vector_batch.processBatch(operation);
         self.statistics.vectors_processed += count_before;
+        self.cycle_count += 1;
+    }
+
+    /// Routes the RSF coupling batch operations. Every path validates the
+    /// parameter bindings first, so an unbound or foreign-model tensor is
+    /// rejected with a typed error instead of being executed.
+    fn processCouplingBatch(self: *Self, operation: BatchOperation) !void {
+        const rows = self.coupling_batch.count;
+        if (rows == 0) {
+            self.cycle_count += 1;
+            return;
+        }
+        const scale = try self.allocator.alloc(f32, self.coupling_batch.dim);
+        defer self.allocator.free(scale);
+        const trans = try self.allocator.alloc(f32, self.coupling_batch.dim);
+        defer self.allocator.free(trans);
+
+        switch (operation) {
+            .coupling_forward => |params| {
+                _ = try self.coupling_batch.forward(params, scale, trans);
+                self.statistics.coupling_ops += rows;
+                self.statistics.latents_flowed += rows;
+            },
+            .coupling_inverse => |params| {
+                _ = try self.coupling_batch.inverse(params, scale, trans);
+                self.statistics.coupling_ops += rows;
+                self.statistics.latents_flowed += rows;
+            },
+            .coupling_adjoint => |params| {
+                try self.couplingAdjointBatch(params);
+                self.statistics.coupling_ops += rows;
+            },
+            .coupling_diffuse => {
+                try self.coupling_batch.diffuse();
+                self.statistics.diffusion_rows += rows;
+            },
+            .coupling_causal_forward => |params| {
+                var scratch = try CausalCouplingScratch.init(self.allocator, params.mask.?.seq_len, self.coupling_batch.dim);
+                defer scratch.deinit();
+                _ = try self.coupling_batch.causalForward(params, &scratch);
+                self.statistics.coupling_ops += rows;
+                self.statistics.latents_flowed += rows;
+                self.statistics.causal_masks_built += 1;
+            },
+            else => unreachable,
+        }
+        self.cycle_count += 1;
+    }
+
+    /// Adjoint of the canonical coupling over the whole batch.
+    ///
+    /// `coupling_batch` holds the layer *inputs* `(x1, x2)` and
+    /// `gradient_batch` holds the incoming output gradient `(dy1, dy2)`; on
+    /// return `gradient_batch` holds `∂L/∂x` for the layer input and the four
+    /// parameter-gradient channels have been accumulated into
+    /// `self.parameterGradS` / `self.parameterGradT` (each `[dim, 2]`, laid out
+    /// exactly like a layer's `.gradient` tensor so they can be handed straight
+    /// to `RSF.accumulateLayerGradients`). No activation is stored anywhere:
+    /// the forward state inside `couplingAdjointRow` is recomputed from the
+    /// inputs, which is the same recomputation discipline the fused backward
+    /// kernel uses.
+    pub fn couplingAdjointBatch(self: *Self, params: CouplingParamsRef) !void {
+        try params.validate();
+        const dim = self.coupling_batch.dim;
+        if (params.dim != dim) return core_types.RSFBindingError.RSFDimMismatch;
+        if (self.gradient_batch.count != self.coupling_batch.count) return error.StateShapeMismatch;
+        if (self.parameterGradS.len != dim * core_tensor.coupling_width) return error.StateShapeMismatch;
+        const p = try params.params();
+        var scratch = try core_tensor.InvertedFlowScratch.init(self.allocator, dim);
+        defer scratch.deinit();
+
+        for (0..self.coupling_batch.count) |b| {
+            const activation = try self.coupling_batch.row(b);
+            const gradient = try self.gradient_batch.row(b);
+            _ = try core_tensor.couplingAdjointRow(
+                p,
+                activation[0..dim],
+                activation[dim .. 2 * dim],
+                gradient[0..dim],
+                gradient[dim .. 2 * dim],
+                gradient[0..dim],
+                gradient[dim .. 2 * dim],
+                self.parameterGradS,
+                self.parameterGradT,
+                1.0,
+                0.0,
+                &scratch,
+            );
+        }
+    }
+
+    /// Binds both coupling batches to a model and clears any previous rows.
+    /// The parameter-gradient accumulators are (re)allocated zeroed at
+    /// `[dim, 2]` each, matching a layer's `.gradient` tensor layout.
+    pub fn bindCouplingBatch(self: *Self, model: *const RSF) !void {
+        const dim = try model.dim();
+        const binding = try model.latentBinding();
+        self.coupling_batch.deinit();
+        self.gradient_batch.deinit();
+        self.coupling_batch = CouplingBatch.init(self.allocator, dim, binding);
+        self.gradient_batch = CouplingBatch.init(self.allocator, dim, binding);
+        if (self.parameterGradS.len != dim * core_tensor.coupling_width) {
+            if (self.parameterGradS.len > 0) self.allocator.free(self.parameterGradS);
+            if (self.parameterGradT.len > 0) self.allocator.free(self.parameterGradT);
+            self.parameterGradS = try self.allocator.alloc(f32, dim * core_tensor.coupling_width);
+            self.parameterGradT = try self.allocator.alloc(f32, dim * core_tensor.coupling_width);
+        }
+        @memset(self.parameterGradS, 0.0);
+        @memset(self.parameterGradT, 0.0);
+    }
+
+    pub fn zeroParameterGradients(self: *Self) void {
+        @memset(self.parameterGradS, 0.0);
+        @memset(self.parameterGradT, 0.0);
+    }
+
+    pub fn addCouplingRow(self: *Self, row: []const f32) !usize {
+        return try self.coupling_batch.addRow(row);
+    }
+
+    pub fn addGradientRow(self: *Self, row: []const f32) !usize {
+        return try self.gradient_batch.addRow(row);
+    }
+
+    pub fn couplingRowCount(self: *const Self) usize {
+        return self.coupling_batch.count;
+    }
+
+    /// Deterministically hashes a node's payload into a `2*dim` latent row
+    /// scaled to `[-1, 1]`. FNV-1a over the bytes seeds a splitmix64 stream,
+    /// so the same graph always produces the same latents on every run and on
+    /// every host — no PRNG state, no allocation beyond the output.
+    pub fn hashNodePayload(node_data: []const u8, dim: usize, out: []f32) !void {
+        if (dim == 0) return error.ZeroDimension;
+        if (out.len != dim * 2) return error.StateShapeMismatch;
+        var hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for (node_data) |byte| {
+            hash ^= byte;
+            hash = hash *% 0x100_0000_01b3;
+        }
+        var state = hash;
+        for (0..dim * 2) |i| {
+            state +%= 0x9E37_79B9_7F4A_7C15;
+            var z = state;
+            z = (z ^ (z >> 30)) *% 0xBF58_476D_1CE4_E5B9;
+            z = (z ^ (z >> 27)) *% 0x94D0_49BB_1331_11EB;
+            z = z ^ (z >> 31);
+            const unit = @as(f64, @floatFromInt(z >> 40)) / @as(f64, @floatFromInt(1 << 24));
+            out[i] = @as(f32, @floatCast(unit * 2.0 - 1.0));
+        }
+    }
+
+    /// Flows every node of a relational graph through `model`, replacing the
+    /// NSIR topology embedding with a real RSF latent per node.
+    ///
+    /// Each node's payload is hashed deterministically into a one-row
+    /// `RSFLatentState` (see `hashNodePayload`), flowed through the whole stack
+    /// with `forwardLatentWithLogDet`, and stored with its measured per-row
+    /// log-det. Edge weights are then set to the cosine of the endpoint
+    /// latents through `SelfSimilarRelationalGraph.updateEdgeWeight` — the
+    /// graph's own edge API, so the relational structure is re-weighted by
+    /// measured latent geometry rather than by a synthetic value.
+    pub fn computeGraphLatents(
+        self: *Self,
+        graph: *SelfSimilarRelationalGraph,
+        model: *RSF,
+        allocator: Allocator,
+    ) !ArrayList(RSFLatentState) {
+        const dim = try model.dim();
+        var latents = ArrayList(RSFLatentState).init(allocator);
+        errdefer {
+            for (latents.items) |*l| l.deinit();
+            latents.deinit();
+        }
+
+        var ids = try allocator.alloc([]const u8, graph.nodes.count());
+        defer allocator.free(ids);
+        var idx: usize = 0;
+        var it = graph.nodes.keyIterator();
+        while (it.next()) |key| {
+            ids[idx] = key.*;
+            idx += 1;
+        }
+        std.mem.sort([]const u8, ids, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+
+        const row = try allocator.alloc(f32, dim * 2);
+        defer allocator.free(row);
+        var state = try RSFLatentState.init(allocator, model, 1);
+        defer state.deinit();
+        const even = try state.evenView();
+        const odd = try state.oddView();
+
+        for (ids) |node_id| {
+            const node = graph.getNodeConst(node_id) orelse continue;
+            try hashNodePayload(node.data, dim, row);
+            try even.copyRowFrom(0, row[0..dim]);
+            try odd.copyRowFrom(0, row[dim .. 2 * dim]);
+            state.log_det = 0.0;
+            state.log_det += try model.forwardLatentWithLogDet(&state);
+            const owned = try state.clone(allocator);
+            try latents.append(owned);
+            self.statistics.latents_flowed += 1;
+            self.statistics.coupling_ops += try model.layerCount();
+        }
+
+        // Re-weight the edges by the measured cosine of the endpoint latents.
+        for (0..ids.len) |a| {
+            for (0..ids.len) |b| {
+                if (a == b) continue;
+                if (!graph.hasEdge(ids[a], ids[b])) continue;
+                const cosine = try latentCosine(latents.items[a], latents.items[b]);
+                _ = graph.updateEdgeWeight(ids[a], ids[b], @as(f64, cosine)) catch 0;
+            }
+        }
+
+        self.statistics.graph_operations += 1;
+        self.cycle_count += 1;
+        return latents;
+    }
+
+    /// Applies `layers` coupling forwards to a single latent row, gated per
+    /// channel by `mask`'s row bits: a set bit applies the coupling to that
+    /// coordinate, a cleared bit leaves it untouched (per-channel bypass).
+    ///
+    /// The mask must carry `2*dim` columns for the state's dim. All bits set
+    /// reduces exactly to the ordinary forward; no bits set is the identity.
+    pub fn scatterFlowPropagate(
+        self: *Self,
+        state: *RSFLatentState,
+        mask: *const BitmaskMatrix,
+        row: usize,
+        model: *const RSF,
+        layers: usize,
+    ) !void {
+        const dim = try model.dim();
+        if (mask.cols != dim * 2) return error.StateShapeMismatch;
+        if (row >= mask.rows) return error.OutOfBounds;
+        const total_layers = try model.layerCount();
+        const depth = @min(layers, total_layers);
+        if (depth == 0) return;
+
+        const scale = try self.allocator.alloc(f32, dim);
+        defer self.allocator.free(scale);
+        const trans = try self.allocator.alloc(f32, dim);
+        defer self.allocator.free(trans);
+        const blocked = try self.allocator.alloc(f32, dim * 2);
+        defer self.allocator.free(blocked);
+        const s_params = try self.allocator.alloc(f32, dim * core_tensor.coupling_width);
+        defer self.allocator.free(s_params);
+        const t_params = try self.allocator.alloc(f32, dim * core_tensor.coupling_width);
+        defer self.allocator.free(t_params);
+
+        const even = try state.evenView();
+        const odd = try state.oddView();
+
+        var layer: usize = 0;
+        while (layer < depth) : (layer += 1) {
+            try model.readLayerWeights(layer, s_params, t_params);
+            const params = try core_tensor.RSFCouplingParams.init(s_params, t_params, dim, core_tensor.rsf_default_clip_min, core_tensor.rsf_default_clip_max);
+
+            // Gather the row, apply the coupling to every channel, then write
+            // back only the channels whose mask bit is set.
+            var d: usize = 0;
+            while (d < dim) : (d += 1) {
+                blocked[d] = try even.get(0, d);
+                blocked[dim + d] = try odd.get(0, d);
+            }
+            const logdet = try core_tensor.couplingForwardRows(params, blocked, 1, scale, trans);
+            state.log_det += @as(f32, @floatCast(logdet));
+
+            var skip: usize = 0;
+            while (skip < dim * 2) : (skip += 1) {
+                if (!mask.get(row, skip)) continue;
+                if (skip < dim) {
+                    try even.set(0, skip, blocked[skip]);
+                } else {
+                    try odd.set(0, skip - dim, blocked[skip]);
+                }
+            }
+            self.statistics.coupling_ops += 1;
+        }
+        self.statistics.latents_flowed += 1;
+        self.cycle_count += depth;
+    }
+
+    /// Builds a `[nodes, 2*dim]` bitmask of the latent channels whose
+    /// magnitude exceeds `threshold` — a measured sparsity signal for the
+    /// scatter-flow scheduler, not an estimate.
+    pub fn latentChannelMask(
+        self: *Self,
+        latents: []RSFLatentState,
+        threshold: f32,
+        allocator: Allocator,
+    ) !BitmaskMatrix {
+        if (latents.len == 0) return error.ZeroDimension;
+        const dim = latents[0].binding.dim;
+        var matrix = try BitmaskMatrix.init(allocator, latents.len, dim * 2);
+        errdefer matrix.deinit();
+        for (latents, 0..) |*latent, row| {
+            if (latent.binding.dim != dim) return error.StateShapeMismatch;
+            const even = try latent.evenView();
+            const odd = try latent.oddView();
+            for (0..dim) |d| {
+                if (@abs(try even.get(0, d)) > threshold) matrix.set(row, d);
+                if (@abs(try odd.get(0, d)) > threshold) matrix.set(row, dim + d);
+            }
+        }
+        self.statistics.bitmask_operations += 1;
+        self.cycle_count += 1;
+        return matrix;
+    }
+
+    /// Flows a latent state through `model`, measuring the same statistics the
+    /// other entry points do. Convenience wrapper used by the R-GPU fabric and
+    /// by the cross-module invariant suite.
+    pub fn flowLatent(self: *Self, model: *RSF, state: *RSFLatentState) !void {
+        state.log_det += try model.forwardLatentWithLogDet(state);
+        self.statistics.latents_flowed += 1;
+        self.statistics.coupling_ops += try model.layerCount();
         self.cycle_count += 1;
     }
 

@@ -956,6 +956,43 @@ pub const SelfSimilarRelationalGraph = struct {
         return null;
     }
 
+    /// Mutable counterpart of `getEdgesConst`. Returns a slice over the edge
+    /// list stored under `(source, target)` so callers can update weights in
+    /// place. Returns `null` when either endpoint is missing or no edge list
+    /// exists for the ordered pair. `topology_hash` is *not* invalidated: edge
+    /// weights are signal, not topology, and `markTopologyDirty` is reserved
+    /// for structural changes (node/edge insertion and removal).
+    pub fn getEdgesMut(self: *SelfSimilarRelationalGraph, source: []const u8, target: []const u8) ?[]Edge {
+        const s_node = self.nodes.getPtr(source) orelse return null;
+        const t_node = self.nodes.getPtr(target) orelse return null;
+        const key = EdgeKey{ .source = s_node.id, .target = t_node.id };
+        if (self.edges.getPtr(key)) |list| return list.items;
+        return null;
+    }
+
+    /// Overwrites the weight of every stored edge of the ordered pair. Returns
+    /// the number of edges updated; `0` when the pair carries no edge, and
+    /// `error.NodeNotFound` when an endpoint is absent. Non-finite weights are
+    /// rejected with `error.InvalidWeight` before any mutation.
+    pub fn updateEdgeWeight(self: *SelfSimilarRelationalGraph, source: []const u8, target: []const u8, weight: f64) !usize {
+        if (!std.math.isFinite(weight)) return error.InvalidWeight;
+        const s_node = self.nodes.getPtr(source) orelse return error.NodeNotFound;
+        const t_node = self.nodes.getPtr(target) orelse return error.NodeNotFound;
+        const key = EdgeKey{ .source = s_node.id, .target = t_node.id };
+        const list = self.edges.getPtr(key) orelse return 0;
+        for (list.items) |*edge| edge.weight = weight;
+        return list.items.len;
+    }
+
+    /// Returns the stored edge weight of the first edge of the ordered pair,
+    /// or `null` when the pair is absent. Used by tests to assert that
+    /// `computeGraphLatents` really wrote the cosine through this API.
+    pub fn edgeWeight(self: *const SelfSimilarRelationalGraph, source: []const u8, target: []const u8) ?f64 {
+        const edges = self.getEdgesConst(source, target) orelse return null;
+        if (edges.len == 0) return null;
+        return edges[0].weight;
+    }
+
     pub fn hasEdge(self: *const SelfSimilarRelationalGraph, source: []const u8, target: []const u8) bool {
         const s_node = self.nodes.getPtr(source) orelse return false;
         const t_node = self.nodes.getPtr(target) orelse return false;
