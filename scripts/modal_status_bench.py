@@ -90,7 +90,6 @@ NCCL_IB_DISABLE = os.environ.get("JAIDE_BENCH_NCCL_IB_DISABLE", "1" if MASTER_IS
 NCCL_SOCKET_IFNAME = os.environ.get("JAIDE_BENCH_NCCL_SOCKET_IFNAME", "lo" if MASTER_IS_LOOPBACK else "^lo,docker")
 CUDA_DEVICE_ORDER = os.environ.get("JAIDE_BENCH_CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 DATASET_PATH = "/data/dataset/finephrase_bench.jsonl"
-TOKEN_DATASET_PATH = "/data/dataset/finephrase_bench.bin"
 CHECKPOINT_PATH = os.environ.get("JAIDE_BENCH_CHECKPOINT_PATH", "/checkpoints/tokenizer.vocab")
 VOCAB_SIZE = int(os.environ.get("JAIDE_BENCH_VOCAB_SIZE", "32000"))
 SPECTRAL_NORM_TARGET = os.environ.get("JAIDE_BENCH_SPECTRAL_NORM_TARGET", "0.9")
@@ -548,198 +547,31 @@ def _write_report(report_dir: Path, name: str, content: str) -> None:
     _log(f"Jelentés elmentve: {fp}")
 
 
-def _count_nonempty_lines(path: Path) -> int:
+def _count_valid_dataset_samples(path: Path, limit: int) -> int:
+    if limit <= 0:
+        raise ValueError("A mintakorlátnak pozitívnak kell lennie")
     count = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if line.strip():
-                count += 1
-    return count
-
-
-def _read_token_dataset_meta(path: Path) -> Optional[Dict[str, int]]:
-    try:
-        with path.open("rb") as source:
-            header = source.read(64)
-        if len(header) != 64 or header[:8] != b"JAIDETOK":
-            return None
-        version, token_type = struct.unpack_from("<II", header, 8)
-        header_size, total_tokens, vocabulary_size, maximum_sequence_length = struct.unpack_from(
-            "<QQQQ", header, 16
-        )
-        if version != 1 or token_type != 0 or header_size < 64 or header_size % 64 != 0:
-            return None
-        if total_tokens <= 0 or vocabulary_size <= 0 or maximum_sequence_length <= 0:
-            return None
-        expected_size = header_size + total_tokens * 4
-        if path.stat().st_size != expected_size:
-            return None
-        return {
-            "header_size": header_size,
-            "total_tokens": total_tokens,
-            "vocabulary_size": vocabulary_size,
-            "maximum_sequence_length": maximum_sequence_length,
-        }
-    except (OSError, struct.error, ValueError):
-        return None
-
-
-def _parallel_pretokenize(
-    pretokenize_bin: Path,
-    input_path: Path,
-    output_tmp: Path,
-    vocab_path: Path,
-    max_seq_len: int,
-    sample_cap: int,
-    project_dir: str,
-    env: Dict[str, str],
-    timeout: int,
-) -> Tuple[int, int, float]:
-    worker_setting = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_WORKERS", "16"))
-    worker_count = max(1, min(worker_setting, os.cpu_count() or 1, sample_cap))
-    samples_per_worker = (sample_cap + worker_count - 1) // worker_count
-    work_dir = Path("/tmp") / f"jaide-pretokenize-{os.getpid()}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    part_counts = [0] * worker_count
-    part_inputs = [work_dir / f"input-{index:03d}.jsonl" for index in range(worker_count)]
-    part_outputs = [work_dir / f"output-{index:03d}.bin" for index in range(worker_count)]
-    processes: List[subprocess.Popen[Any]] = []
-    log_files: List[Any] = []
-    t0 = time.time()
-
-    try:
-        handles = [path.open("wb") for path in part_inputs]
-        try:
-            written = 0
-            with input_path.open("rb") as source:
-                for raw_line in source:
-                    if not raw_line.strip():
-                        continue
-                    if written >= sample_cap:
-                        break
-                    part_index = min(written // samples_per_worker, worker_count - 1)
-                    handles[part_index].write(raw_line)
-                    part_counts[part_index] += 1
-                    written += 1
-        finally:
-            for handle in handles:
-                handle.close()
-
-        if written != sample_cap:
-            raise RuntimeError(
-                f"A bemeneti dataset csak {written} nem üres mintát tartalmaz, "
-                f"de {sample_cap} szükséges"
-            )
-
-        for index, count in enumerate(part_counts):
-            if count == 0:
+    with path.open("rb") as source:
+        for raw_line in source:
+            if not raw_line.strip():
                 continue
-            log_path = work_dir / f"worker-{index:03d}.log"
-            log_file = log_path.open("w", encoding="utf-8")
-            log_files.append(log_file)
-            process = subprocess.Popen(
-                [
-                    str(pretokenize_bin),
-                    str(part_inputs[index]),
-                    str(part_outputs[index]),
-                    str(vocab_path),
-                    str(max_seq_len),
-                    str(count),
-                ],
-                cwd=project_dir,
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            processes.append(process)
-
-        deadline = time.monotonic() + timeout
-        while True:
-            unfinished = [process for process in processes if process.poll() is None]
-            if not unfinished:
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            text = record.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            count += 1
+            if count >= limit:
                 break
-            if time.monotonic() >= deadline:
-                for process in unfinished:
-                    _terminate_process_group(process)
-                raise RuntimeError("A párhuzamos előtokenizálás túllépte az időkorlátot")
-            time.sleep(0.1)
-
-        failures = [process.returncode for process in processes if process.returncode != 0]
-        if failures:
-            worker_logs = []
-            for index in range(worker_count):
-                log_path = work_dir / f"worker-{index:03d}.log"
-                if log_path.is_file():
-                    worker_logs.append(log_path.read_text(encoding="utf-8", errors="replace"))
-            raise RuntimeError(
-                f"{len(failures)} előtokenizáló worker hibával állt le:\n"
-                + "\n".join(worker_logs)
-            )
-
-        part_meta: List[Dict[str, int]] = []
-        total_tokens = 0
-        vocabulary_size = 0
-        maximum_sequence_length = 0
-        for index, count in enumerate(part_counts):
-            if count == 0:
-                continue
-            meta = _read_token_dataset_meta(part_outputs[index])
-            if meta is None:
-                raise RuntimeError(f"Hibás worker output: {part_outputs[index]}")
-            expected_tokens = count * (max_seq_len + 1)
-            if (
-                meta["total_tokens"] != expected_tokens
-                or meta["maximum_sequence_length"] != max_seq_len
-            ):
-                raise RuntimeError(
-                    f"A worker output mérete hibás: {part_outputs[index]} "
-                    f"(várt tokenek: {expected_tokens}, kapott: {meta['total_tokens']})"
-                )
-            if vocabulary_size == 0:
-                vocabulary_size = meta["vocabulary_size"]
-                maximum_sequence_length = meta["maximum_sequence_length"]
-            elif (
-                vocabulary_size != meta["vocabulary_size"]
-                or maximum_sequence_length != meta["maximum_sequence_length"]
-            ):
-                raise RuntimeError("A worker outputok fejlécei nem egyeznek")
-            total_tokens += meta["total_tokens"]
-            part_meta.append(meta)
-
-        with output_tmp.open("wb") as target:
-            target.write(
-                struct.pack(
-                    "<8sIIQQQQQQ",
-                    b"JAIDETOK",
-                    1,
-                    0,
-                    64,
-                    total_tokens,
-                    vocabulary_size,
-                    maximum_sequence_length,
-                    0,
-                    0,
-                )
-            )
-            for index, count in enumerate(part_counts):
-                if count == 0:
-                    continue
-                with part_outputs[index].open("rb") as source:
-                    source.seek(part_meta.pop(0)["header_size"])
-                    shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
-            target.flush()
-            os.fsync(target.fileno())
-
-        return sample_cap, output_tmp.stat().st_size, time.time() - t0
-    finally:
-        for process in processes:
-            if process.poll() is None:
-                _terminate_process_group(process)
-        for log_file in log_files:
-            log_file.close()
-        shutil.rmtree(work_dir, ignore_errors=True)
+    return count
 
 
 def _is_current_vocab_format(path: Path) -> bool:
@@ -1018,46 +850,26 @@ def inspect_prepared_state(run_id: int) -> Dict[str, Any]:
     build_volume.reload()
 
     source_fp = _source_fingerprint(PROJECT_MOUNT_PATH)
-    token_dataset_path = Path(TOKEN_DATASET_PATH)
-    dataset_meta = _read_token_dataset_meta(token_dataset_path)
+    dataset_path = Path(DATASET_PATH)
 
     dataset_phase: Dict[str, Any] = {
-        "dataset_path": str(token_dataset_path),
-        "source_dataset_path": str(DATASET_PATH),
+        "dataset_path": str(dataset_path),
         "source": "modal_volume:jaide-bench-data",
         "separate_modal_run": True,
         "reused": True,
     }
 
-    if dataset_meta is None:
+    if not dataset_path.is_file() or dataset_path.stat().st_size <= 0:
         dataset_phase["sample_count"] = 0
         dataset_phase["dataset_bytes"] = 0
-        dataset_phase["pretokenized"] = False
-        _log(f"A token dataset hiányzik vagy érvénytelen: {token_dataset_path}")
+        _log(f"A benchmark adathalmaz hiányzik vagy üres: {dataset_path}")
     else:
-        window_length = dataset_meta["maximum_sequence_length"] + 1
-        if dataset_meta["total_tokens"] % window_length != 0:
-            raise RuntimeError(
-                f"A kész token dataset token-száma nem osztható a mintablokk méretével: {token_dataset_path}"
-            )
-        if dataset_meta["maximum_sequence_length"] != MAX_SEQ_LEN:
-            raise RuntimeError(
-                "A meglévő token dataset szekvenciahossza eltér a kért JAIDE_BENCH_MAX_SEQ_LEN értéktől: "
-                f"{dataset_meta['maximum_sequence_length']} != {MAX_SEQ_LEN}"
-            )
-        if dataset_meta["vocabulary_size"] != VOCAB_SIZE:
-            raise RuntimeError(
-                "A meglévő token dataset szótármérete eltér a kért JAIDE_BENCH_VOCAB_SIZE értéktől: "
-                f"{dataset_meta['vocabulary_size']} != {VOCAB_SIZE}"
-            )
-        dataset_phase["sample_count"] = dataset_meta["total_tokens"] // window_length
-        dataset_phase["dataset_bytes"] = token_dataset_path.stat().st_size
-        dataset_phase["pretokenized"] = True
-        dataset_phase["maximum_sequence_length"] = dataset_meta["maximum_sequence_length"]
-        dataset_phase["vocabulary_size"] = dataset_meta["vocabulary_size"]
-        dataset_phase["total_tokens"] = dataset_meta["total_tokens"]
+        dataset_phase["sample_count"] = _count_valid_dataset_samples(dataset_path, SAMPLE_CAP)
+        dataset_phase["dataset_bytes"] = dataset_path.stat().st_size
+        dataset_phase["maximum_sequence_length"] = MAX_SEQ_LEN
+        dataset_phase["vocabulary_size"] = VOCAB_SIZE
         _log(
-            f"A token dataset ellenőrizve: {dataset_phase['sample_count']} minta, "
+            f"Az adathalmaz ellenőrizve: {dataset_phase['sample_count']} minta, "
             f"{dataset_phase['dataset_bytes']} bájt"
         )
 
@@ -1108,7 +920,6 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     checkpoint_volume.reload()
 
     project_dir = str(PROJECT_MOUNT_PATH)
-    env = os.environ.copy()
 
     report_dir = REPORT_MOUNT_PATH / f"run_{run_id}"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1118,34 +929,6 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
         "report_dir": str(report_dir),
         "phases": {},
     }
-    token_dataset_path = Path(TOKEN_DATASET_PATH)
-
-    existing_dataset_meta = _read_token_dataset_meta(token_dataset_path)
-    if existing_dataset_meta is not None:
-        window_length = existing_dataset_meta["maximum_sequence_length"] + 1
-        if existing_dataset_meta["total_tokens"] % window_length != 0:
-            raise RuntimeError(
-                f"A kész token dataset token-száma nem osztható a mintablokk méretével: {token_dataset_path}"
-            )
-        sample_count = existing_dataset_meta["total_tokens"] // window_length
-        result["distributed_binary_present"] = False
-        result["inference_binary_present"] = False
-        result["phases"]["C_prep_dataset"] = {
-            "duration_s": 0.0,
-            "sample_count": sample_count,
-            "dataset_bytes": token_dataset_path.stat().st_size,
-            "dataset_path": str(token_dataset_path),
-            "source_dataset_path": str(DATASET_PATH),
-            "source": "modal_volume:jaide-bench-data",
-            "pretokenized": True,
-            "reused": True,
-        }
-        _log(
-            f"A végleges bináris dataset már létezik, újrahasználva: "
-            f"{sample_count} minta, {token_dataset_path.stat().st_size} bájt"
-        )
-        report_volume.commit()
-        return result
 
     _log("=" * 70)
     _log(f"CPU ELŐKÉSZÍTÉSI FÁZIS run_id={run_id}")
@@ -1186,7 +969,7 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     if not FORCE_REBUILD and existing_dist and existing_inf:
         _log(f"Legfrissebb lefordított bináris megtalálva: {existing_dist}")
         _log(f"Legfrissebb inferencia bináris megtalálva: {existing_inf}")
-        _log("A GPU binárisok újrafordítása átugorva; csak a dataset készül elő.")
+        _log("A GPU binárisok újrafordítása átugorva; csak a dataset ellenőrzése fut le.")
         build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
         build_target_dir.mkdir(parents=True, exist_ok=True)
         dist_dst = build_target_dir / "jaide-distributed-futhark"
@@ -1209,7 +992,7 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
             "reused_binary": str(existing_dist),
         }
     if not cached_binaries_reused:
-        _log("A prep nem fordít GPU binárisokat; csak az előtokenizált dataset készül.")
+        _log("A prep nem fordít GPU binárisokat; csak a dataset ellenőrzése fut le.")
         result["distributed_binary_present"] = False
         result["inference_binary_present"] = False
 
@@ -1240,47 +1023,27 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
         _log(f"FIGYELMEZTETÉS: az inferencia bináris nem épült fel itt: {inference_bin}")
 
     _log("=" * 70)
-    _log(f"C-előkészítő fázis: {SAMPLE_CAP} minta előtokenizálása GPU tréninghez")
+    _log(f"C-előkészítő fázis: legfeljebb {SAMPLE_CAP} minta ellenőrzése a GPU tréninghez")
     _log("=" * 70)
-    token_dataset_path.parent.mkdir(parents=True, exist_ok=True)
-    pretokenize_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-pretokenize"
-    if not pretokenize_bin.is_file():
-        _run(
-            ["zig", "build", "pretokenize", "-Doptimize=ReleaseSafe", "-Dskip-futhark=true"],
-            cwd=project_dir,
-            env=env,
-            timeout=CPU_TIMEOUT_SEC,
+    prep_started = time.time()
+    sample_count = _count_valid_dataset_samples(dataset_path, SAMPLE_CAP)
+    if sample_count <= 0:
+        raise RuntimeError(
+            "A Modal volume datasetje nem tartalmaz érvényes JSONL rekordot nem üres "
+            f"'text' mezővel: {dataset_path}"
         )
-    if not pretokenize_bin.is_file():
-        raise RuntimeError(f"Az előtokenizáló bináris hiányzik: {pretokenize_bin}")
-    _safe_unlink(token_dataset_path)
-    _safe_unlink(token_dataset_path.with_name(token_dataset_path.name + ".tmp"))
-    pretokenize_tmp = token_dataset_path.with_name(token_dataset_path.name + ".tmp")
-    vocab_path = Path(CHECKPOINT_PATH)
-    if not vocab_path.is_file() or vocab_path.stat().st_size <= 0:
-        raise RuntimeError(f"A Modal checkpoint tokenizer hiányzik vagy üres: {vocab_path}")
-    sample_count, size, prep_duration = _parallel_pretokenize(
-        pretokenize_bin=pretokenize_bin,
-        input_path=dataset_path,
-        output_tmp=pretokenize_tmp,
-        vocab_path=vocab_path,
-        max_seq_len=MAX_SEQ_LEN,
-        sample_cap=SAMPLE_CAP,
-        project_dir=project_dir,
-        env=env,
-        timeout=CPU_TIMEOUT_SEC,
-    )
-    pretokenize_tmp.replace(token_dataset_path)
+    dataset_bytes = dataset_path.stat().st_size
+    prep_duration = time.time() - prep_started
     result["phases"]["C_prep_dataset"] = {
         "duration_s": round(prep_duration, 2),
         "sample_count": sample_count,
-        "dataset_bytes": size,
-        "dataset_path": str(token_dataset_path),
-        "source_dataset_path": str(dataset_path),
+        "dataset_bytes": dataset_bytes,
+        "dataset_path": str(dataset_path),
         "source": "modal_volume:jaide-bench-data",
-        "pretokenized": True,
+        "maximum_sequence_length": MAX_SEQ_LEN,
+        "vocabulary_size": VOCAB_SIZE,
     }
-    _log(f"Modal volume dataset készen áll: {sample_count} minta, {size} bájt")
+    _log(f"Modal volume dataset készen áll: {sample_count} minta, {dataset_bytes} bájt")
 
     data_volume.commit()
     checkpoint_volume.commit()
@@ -1395,18 +1158,14 @@ def run_gpu_train_and_infer(
     dataset_meta = prep_result.get("phases", {}).get("C_prep_dataset", {})
     dataset_path = dataset_meta.get("dataset_path") or DATASET_PATH
     sample_count = int(dataset_meta.get("sample_count", 0) or 0)
-    token_dataset_file = Path(dataset_path)
-    if (
-        not token_dataset_file.is_file()
-        or token_dataset_file.stat().st_size < 64
-        or (token_dataset_file.stat().st_size - 64) % 4 != 0
-    ):
+    dataset_file = Path(dataset_path)
+    if not dataset_file.is_file() or dataset_file.stat().st_size <= 0:
         raise RuntimeError(
             "A külön dataset-előkészítő Modal futás nem fejeződött be sikeresen: "
-            f"érvénytelen vagy hiányzó token dataset: {token_dataset_file}"
+            f"érvénytelen vagy hiányzó dataset: {dataset_file}"
         )
-    if sample_count <= 0 and token_dataset_file.exists():
-        sample_count = _count_nonempty_lines(Path(dataset_path))
+    if sample_count <= 0:
+        sample_count = _count_valid_dataset_samples(dataset_file, SAMPLE_CAP)
 
     training_succeeded = False
     training_started_ns = 0

@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const gpu_enabled = b.option(bool, "gpu", "Enable GPU/CUDA via the Futhark CUDA backend") orelse false;
-    const rtl_enabled = b.option(bool, "rtl", "Compile the Clash RTL modules and link the RTL simulator") orelse false;
+    const rtl_enabled = b.option(bool, "rtl", "Compile the Clash RTL modules into a shared library") orelse false;
     const skip_futhark = b.option(bool, "skip-futhark", "Assume the generated Futhark C sources are already present") orelse false;
     const clash_bin = b.option([]const u8, "clash", "Clash compiler executable") orelse "clash";
 
@@ -133,19 +133,6 @@ pub fn build(b: *std.Build) void {
         distributed_futhark_step.dependOn(&distributed_futhark_unavailable.step);
     }
 
-    const pretokenize_exe = b.addExecutable(.{
-        .name = "jaide-pretokenize",
-        .root_source_file = b.path("src/pretokenize_main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    pretokenize_exe.linkLibC();
-    pretokenize_exe.root_module.addOptions("build_options", build_options);
-
-    b.installArtifact(pretokenize_exe);
-    const pretokenize_step = b.step("pretokenize", "Build the binary dataset pre-tokenizer");
-    pretokenize_step.dependOn(&pretokenize_exe.step);
-
     const c_api_lib = b.addStaticLibrary(.{
         .name = "jaide",
         .root_source_file = b.path("src/core_relational/c_api.zig"),
@@ -183,50 +170,6 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&semantic_check_obj.step);
     check_step.dependOn(&distributed_check_obj.step);
 
-    const rsf_substrate_tests = b.addTest(.{
-        .name = "rsf-substrate-tests",
-        .root_source_file = b.path("src/tests/rsf_substrate_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    rsf_substrate_tests.root_module.addOptions("build_options", build_options);
-    rsf_substrate_tests.root_module.addImport("jaide", jaide_mod);
-    const run_rsf_substrate_tests = b.addRunArtifact(rsf_substrate_tests);
-    const test_rsf_step = b.step("test-rsf", "Run the RSF tensor, causal, and spectral substrate tests");
-    test_rsf_step.dependOn(&run_rsf_substrate_tests.step);
-
-    const rsf_native_tests = b.addTest(.{
-        .name = "rsf-native-tests",
-        .root_source_file = b.path("src/tests/rsf_native_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    rsf_native_tests.linkLibC();
-    rsf_native_tests.root_module.addOptions("build_options", build_options);
-    rsf_native_tests.root_module.addImport("jaide", jaide_mod);
-    const run_rsf_native_tests = b.addRunArtifact(rsf_native_tests);
-    const test_rsf_native_step = b.step("test-rsf-native", "Run the accel-free RSF-native cross-module invariant suite");
-    test_rsf_native_step.dependOn(&run_rsf_native_tests.step);
-
-    // The accel-backed half of the invariant suite. Its import closure reaches
-    // `src/hw/accel/accel_interface.zig`, whose `pub extern "c" fn futhark_*`
-    // declarations are called from its destructors, so this artifact needs the
-    // Futhark-generated C to link. It is registered WITHOUT the Futhark
-    // codegen step so the failure surfaces as a link error rather than a
-    // missing-tool error, and it is reported as blocked when that happens.
-    const rsf_native_accel_tests = b.addTest(.{
-        .name = "rsf-native-accel-tests",
-        .root_source_file = b.path("src/tests/rsf_native_accel_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    rsf_native_accel_tests.linkLibC();
-    rsf_native_accel_tests.root_module.addOptions("build_options", build_options);
-    rsf_native_accel_tests.root_module.addImport("jaide", jaide_mod);
-    const run_rsf_native_accel_tests = b.addRunArtifact(rsf_native_accel_tests);
-    const test_rsf_native_accel_step = b.step("test-rsf-native-accel", "Run the accelerator-backed RSF-native invariants (needs the Futhark-generated C)");
-    test_rsf_native_accel_step.dependOn(&run_rsf_native_accel_tests.step);
-
     if (rtl_enabled) {
         const clash_step = b.addSystemCommand(&.{clash_bin});
         clash_step.addArg("--verilog");
@@ -261,24 +204,8 @@ pub fn build(b: *std.Build) void {
             "src/hw/rtl/librtl_sim.so",
         });
 
-        const rtl_exe = b.addExecutable(.{
-            .name = "jaide-rtl-sim",
-            .root_source_file = b.path("src/hw/rtl/rtl_sim_main.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        rtl_exe.linkLibC();
-        rtl_exe.root_module.addOptions("build_options", build_options);
-        rtl_exe.root_module.addImport("jaide", jaide_mod);
-        rtl_exe.addLibraryPath(b.path("src/hw/rtl"));
-        rtl_exe.linkSystemLibrary("rtl_sim");
-        rtl_exe.addRPath(b.path("src/hw/rtl"));
-        rtl_exe.step.dependOn(&ghc_step.step);
-
-        const rtl_install = b.addInstallArtifact(rtl_exe, .{});
-
-        const rtl_step = b.step("rtl", "Build the Clash RTL library and the RTL simulator");
-        rtl_step.dependOn(&rtl_install.step);
+        const rtl_step = b.step("rtl", "Build the Clash RTL library");
+        rtl_step.dependOn(&ghc_step.step);
 
         const rtl_verilog_step = b.step("rtl-verilog", "Generate Verilog from the Clash RTL modules");
         rtl_verilog_step.dependOn(&clash_step.step);

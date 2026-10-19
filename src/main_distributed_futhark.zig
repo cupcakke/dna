@@ -1,7 +1,6 @@
 const std = @import("std");
 const GPUCoordinator = @import("distributed/gpu_coordinator.zig").GPUCoordinator;
 const dataset_partition = @import("distributed/dataset_partition.zig");
-const mmap_dataset = @import("distributed/mmap_token_dataset.zig");
 const dtf = @import("distributed/distributed_trainer_futhark.zig");
 const DistributedTrainerFuthark = dtf.DistributedTrainerFuthark;
 const TrainerConfig = dtf.TrainerConfig;
@@ -1150,7 +1149,6 @@ pub fn main() !void {
     if (relational_pass_interval == 0) {
         return error.InvalidConfig;
     }
-    const training_sample_count = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_MAX_SAMPLES")) orelse 0;
 
     const reconstruction_alpha_string_owned: ?[]u8 = std.process.getEnvVarOwned(
         allocator,
@@ -1245,7 +1243,7 @@ pub fn main() !void {
     defer if (dataset_path_owned) |owned| allocator.free(owned);
 
     const dataset_path: []const u8 = dataset_path_owned orelse
-        "/data/dataset/finephrase_bench.bin";
+        "/data/dataset/finephrase_bench.jsonl";
 
     std.debug.print(
         "[Rank {d}] Loading dataset from {s}\n",
@@ -1430,7 +1428,6 @@ pub fn main() !void {
         trainer_config.gradient_clip_norm = gradient_clip_norm;
         trainer_config.reasoning_cycles = reasoning_cycles;
         trainer_config.relational_pass_interval = relational_pass_interval;
-        trainer_config.training_sample_count = training_sample_count;
         trainer_config.reconstruction_alpha = reconstruction_alpha;
         trainer_config.phase_a_steps = phase_a_steps;
         trainer_config.phase_b_steps = phase_b_steps;
@@ -1463,8 +1460,51 @@ pub fn main() !void {
         break :trainer_initialization initialized_trainer;
     };
     defer trainer.deinit();
-    var token_dataset = try mmap_dataset.MmapTokenDataset.open(dataset_path, tokenizer.next_token_id);
-    defer token_dataset.close();
+
+    const dataset_load_started = std.time.nanoTimestamp();
+    var dataset_stage_error: ?anyerror = null;
+    var loaded_samples: ?[][]const u8 = null;
+    dataset_loading: {
+        loaded_samples = loadDataset(
+            allocator,
+            &coordinator,
+            dataset_path,
+            10 * 1024 * 1024,
+        ) catch |err| {
+            dataset_stage_error = err;
+            break :dataset_loading;
+        };
+    }
+    defer if (loaded_samples) |samples| {
+        for (samples) |sample| {
+            allocator.free(sample);
+        }
+        allocator.free(samples);
+    };
+
+    synchronizeStageStatus(
+        allocator,
+        &coordinator,
+        nccl_id_path,
+        "dataset_load",
+        dataset_stage_error,
+    ) catch |err| {
+        std.debug.print(
+            "[Rank {d}] dataset load stage failed: {}\n",
+            .{ rank, err },
+        );
+        if (@errorReturnTrace()) |trace| {
+            std.debug.dumpStackTrace(trace.*);
+        }
+        return err;
+    };
+
+    const dataset_samples = loaded_samples.?;
+    const dataset_load_elapsed = std.time.nanoTimestamp() - dataset_load_started;
+    std.debug.print(
+        "[Rank {d}] dataset_samples={d} dataset_ms={d}\n",
+        .{ rank, dataset_samples.len, @divTrunc(dataset_load_elapsed, std.time.ns_per_ms) },
+    );
     std.debug.print("[Rank {d}] model_compile_initialization_ms={d}\n", .{ rank, @divTrunc(model_initialization_elapsed, std.time.ns_per_ms) });
 
     const resume_checkpoint_owned = std.process.getEnvVarOwned(allocator, "JAIDE_RESUME_CHECKPOINT") catch |err| switch (err) {
@@ -1531,7 +1571,7 @@ pub fn main() !void {
         );
         std.debug.print(
             "Dataset: {d} samples per rank\n",
-            .{token_dataset.payload.len},
+            .{dataset_samples.len},
         );
         std.debug.print(
             "Batch size: {d} per rank\n",
@@ -1560,7 +1600,7 @@ pub fn main() !void {
             if (coordinator.isRoot()) {
                 std.debug.print(
                     "[Rank {d}] Skipping offline knowledge-graph import samples={d} skip={} resumed={} chunk={d}\n",
-                    .{ rank, token_dataset.payload.len, skip_knowledge_graph, resumed_from_checkpoint, graph_chunk_size },
+                    .{ rank, dataset_samples.len, skip_knowledge_graph, resumed_from_checkpoint, graph_chunk_size },
                 );
             }
             break :graph_construction;
@@ -1668,7 +1708,7 @@ pub fn main() !void {
             );
         }
 
-        const average_loss = trainer.trainEpochTokens(&token_dataset, @intCast(epoch)) catch |err| {
+        const average_loss = trainer.trainEpoch(dataset_samples) catch |err| {
             std.debug.print(
                 "[Rank {d}] trainEpoch ERROR at epoch {d}: {}\n",
                 .{
@@ -1825,7 +1865,7 @@ pub fn main() !void {
                     num_layers,
                     local_batch_size,
                     learning_rate,
-                    token_dataset.payload.len,
+                    dataset_samples.len,
                     num_epochs,
                 ) catch |err| {
                     std.debug.print(

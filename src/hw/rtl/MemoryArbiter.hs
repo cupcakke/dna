@@ -27,7 +27,6 @@ module MemoryArbiter
     , grantForRequestMask
     , memoryArbiter
     , topEntity
-    , testInput
     ) where
 
 import Clash.Prelude
@@ -136,11 +135,3 @@ topEntity
     -> Signal System (Maybe MemResponse)
     -> (Signal System (Maybe MemRequest), Vec NumClients (Signal System (Maybe MemResponse)))
 topEntity = exposeClockResetEnable memoryArbiter
-
-testInput :: Vec NumClients (Signal System (Maybe MemRequest))
-testInput =
-    pure (Just (mkMemRequest 0x1000 False 0 0))
-        :> pure (Just (mkMemRequest 0x2000 True 0xDEADBEEF 1))
-        :> pure Nothing
-        :> pure Nothing
-        :> Nil

@@ -984,15 +984,6 @@ pub const SelfSimilarRelationalGraph = struct {
         return list.items.len;
     }
 
-    /// Returns the stored edge weight of the first edge of the ordered pair,
-    /// or `null` when the pair is absent. Used by tests to assert that
-    /// `computeGraphLatents` really wrote the cosine through this API.
-    pub fn edgeWeight(self: *const SelfSimilarRelationalGraph, source: []const u8, target: []const u8) ?f64 {
-        const edges = self.getEdgesConst(source, target) orelse return null;
-        if (edges.len == 0) return null;
-        return edges[0].weight;
-    }
-
     pub fn hasEdge(self: *const SelfSimilarRelationalGraph, source: []const u8, target: []const u8) bool {
         const s_node = self.nodes.getPtr(source) orelse return false;
         const t_node = self.nodes.getPtr(target) orelse return false;

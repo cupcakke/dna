@@ -19,7 +19,6 @@ const FNDSManager = core_relational.FNDSManager;
 const PatternLocation = core_relational.PatternLocation;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const sfd = @import("../optimizer/sfd.zig");
-const mmap_dataset = @import("mmap_token_dataset.zig");
 const _use_futhark_2d = FutharkArray2DF16;
 const _use_tensor = Tensor;
 pub const CHECKPOINT_MAGIC = checkpoint_envelope.MAGIC;
@@ -145,7 +144,6 @@ pub const TrainerConfig = struct {
     max_node_count: usize = 1 << 20,
     max_distributed_integer: u64 = 16_777_216,
     max_local_batch_size: usize = 1 << 20,
-    training_sample_count: usize = 0,
     tokenizer_vocabulary: []const []const u8 = &.{},
     tokenizer_anchors: []const []const u8 = &.{},
     tokenizer_vocabulary_path: ?[]const u8 = null,
@@ -176,42 +174,6 @@ pub const TrainerConfig = struct {
 pub const TrainerComponents = struct {
     tokenizer: MGT,
 };
-const BatchBufferPool = struct {
-    allocator: std.mem.Allocator,
-    inputs: [2][]u32,
-    targets: [2][]u32,
-    lengths: [2][]usize,
-    fn init(allocator: std.mem.Allocator, batch_size: usize, sequence_length: usize) !BatchBufferPool {
-        const token_capacity = try std.math.mul(usize, batch_size, sequence_length);
-        var result = BatchBufferPool{
-            .allocator = allocator,
-            .inputs = undefined,
-            .targets = undefined,
-            .lengths = undefined,
-        };
-        var initialized: usize = 0;
-        errdefer {
-            var index: usize = 0;
-            while (index < initialized) : (index += 1) {
-                allocator.free(result.inputs[index]);
-                allocator.free(result.targets[index]);
-                allocator.free(result.lengths[index]);
-            }
-        }
-        while (initialized < 2) : (initialized += 1) {
-            result.inputs[initialized] = try allocator.alloc(u32, token_capacity);
-            result.targets[initialized] = try allocator.alloc(u32, token_capacity);
-            result.lengths[initialized] = try allocator.alloc(usize, batch_size);
-        }
-        return result;
-    }
-    fn deinit(self: *BatchBufferPool) void {
-        for (self.inputs) |buffer| self.allocator.free(buffer);
-        for (self.targets) |buffer| self.allocator.free(buffer);
-        for (self.lengths) |buffer| self.allocator.free(buffer);
-        self.* = undefined;
-    }
-};
 pub const TrainerError = error{
     InvalidModelDim,
     InvalidNumLayers,
@@ -227,7 +189,6 @@ pub const TrainerError = error{
     InvalidClipRange,
     InvalidLoss,
     InvalidPinnedMemorySize,
-    IndexOutOfBounds,
     TokenIndexOutOfRange,
     CheckpointVersionMismatch,
     CheckpointMagicMismatch,
@@ -576,7 +537,6 @@ pub const DistributedTrainerFuthark = struct {
     config: TrainerConfig,
     runtime_max_seq_len: usize,
     runtime_tokenizer_max_input_bytes: usize,
-    batch_buffers: BatchBufferPool,
     gpu_embedding: ?accel.EmbeddingAccelerator,
     crev_pipeline: CREVPipeline,
     crev_kernel: *ChaosCoreKernel,
@@ -673,9 +633,6 @@ pub const DistributedTrainerFuthark = struct {
         try validateHyperparameters(config.learning_rate, config.momentum);
         const runtime_max_seq_len = try resolveEnvUsizeDefault(allocator, coordinator.rank, "JAIDE_MAX_SEQ_LEN", config.default_max_seq_len, config.max_distributed_integer);
         const runtime_tokenizer_max_input_bytes = try resolveEnvUsizeDefault(allocator, coordinator.rank, "JAIDE_TOKENIZER_MAX_INPUT_BYTES", 1024, config.max_distributed_integer);
-        var batch_buffers = try BatchBufferPool.init(allocator, local_batch_size, runtime_max_seq_len);
-        var batch_buffers_committed = false;
-        errdefer if (!batch_buffers_committed) batch_buffers.deinit();
         const actual_model_dim = model_dim;
         const vocab_size_init = components.tokenizer.next_token_id;
         const estimate_config = gpu_memory.EstimateConfig{
@@ -833,7 +790,6 @@ pub const DistributedTrainerFuthark = struct {
             .config = config,
             .runtime_max_seq_len = runtime_max_seq_len,
             .runtime_tokenizer_max_input_bytes = runtime_tokenizer_max_input_bytes,
-            .batch_buffers = batch_buffers,
             .gpu_embedding = gpu_embedding,
             .crev_pipeline = crev_pipeline,
             .crev_kernel = crev_kernel_ptr,
@@ -853,7 +809,6 @@ pub const DistributedTrainerFuthark = struct {
             .relational_fast_mode = if (std.posix.getenv("JAIDE_RELATIONAL_FAST")) |v| std.mem.eql(u8, v, "1") else true,
         };
         target_source_committed = true;
-        batch_buffers_committed = true;
         trainer.verifyConfigConsistency(components.tokenizer.next_token_id) catch |err| {
             trainer.accelerator.deinit();
             allocator.destroy(trainer.accelerator);
@@ -1001,7 +956,6 @@ pub const DistributedTrainerFuthark = struct {
         if (self.gpu_embedding) |*emb| emb.deinit();
         self.accelerator.deinit();
         self.allocator.destroy(self.accelerator);
-        self.batch_buffers.deinit();
         self.tokenizer.deinit();
     }
     fn validateHyperparameters(learning_rate: f32, momentum: f32) TrainerError!void {
@@ -1337,121 +1291,6 @@ pub const DistributedTrainerFuthark = struct {
             self.* = undefined;
         }
     };
-    fn prepareTokenBatch(
-        self: *DistributedTrainerFuthark,
-        token_stream: []const u32,
-        batch_size: usize,
-        sequence_length: usize,
-        slot: usize,
-    ) !PreparedBatch {
-        if (slot >= 2 or batch_size == 0 or batch_size > self.local_batch_size or sequence_length == 0) return TrainerError.InvalidBatchSize;
-        const required = std.math.add(usize, sequence_length, 1) catch return TrainerError.ValueOverflow;
-        const source_required = std.math.mul(usize, batch_size, required) catch return TrainerError.ValueOverflow;
-        if (token_stream.len < source_required) return TrainerError.IndexOutOfBounds;
-        const token_count = std.math.mul(usize, batch_size, sequence_length) catch return TrainerError.ValueOverflow;
-        const inputs = self.batch_buffers.inputs[slot][0..token_count];
-        const targets = self.batch_buffers.targets[slot][0..token_count];
-        const lengths = self.batch_buffers.lengths[slot][0..batch_size];
-        @memset(inputs, 0);
-        @memset(targets, 0);
-        @memset(lengths, sequence_length);
-        var batch_index: usize = 0;
-        while (batch_index < batch_size) : (batch_index += 1) {
-            const source_base = std.math.mul(usize, batch_index, required) catch return TrainerError.ValueOverflow;
-            const target_base = std.math.mul(usize, batch_index, sequence_length) catch return TrainerError.ValueOverflow;
-            const source = token_stream[source_base .. source_base + required];
-            const input_row = inputs[target_base .. target_base + sequence_length];
-            const target_row = targets[target_base .. target_base + sequence_length];
-            @memcpy(input_row, source[0..sequence_length]);
-            @memcpy(target_row, source[1 .. sequence_length + 1]);
-            for (input_row) |token| if (@as(usize, token) >= self.vocab_size) return TrainerError.TokenIndexOutOfRange;
-            for (target_row) |token| if (@as(usize, token) >= self.vocab_size) return TrainerError.TokenIndexOutOfRange;
-        }
-        return PreparedBatch{
-            .allocator = self.allocator,
-            .token_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator),
-            .active_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator),
-            .real_sequence_lengths = lengths,
-            .flat_input_tokens = inputs,
-            .flat_target_tokens = targets,
-            .effective_batch_size = batch_size,
-            .sequence_length = sequence_length,
-            .local_active_samples = batch_size,
-            .local_token_count = token_count,
-            .pooled = true,
-        };
-    }
-    pub fn trainEpochTokens(self: *DistributedTrainerFuthark, dataset: *const mmap_dataset.MmapTokenDataset, epoch: u64) !f32 {
-        const window_size = std.math.add(usize, self.runtime_max_seq_len, 1) catch return TrainerError.ValueOverflow;
-        const total_windows = dataset.payload.len / window_size;
-        const selected_windows = if (self.config.training_sample_count == 0)
-            total_windows
-        else
-            @min(total_windows, self.config.training_sample_count);
-        const rank_bounds = try rankWindowBounds(selected_windows, self.coordinator.world_size, self.coordinator.rank);
-        const batch_count = if (rank_bounds.count == 0)
-            0
-        else
-            (rank_bounds.count + self.local_batch_size - 1) / self.local_batch_size;
-        const global_batch_count = try self.allReduceMaximumU64(@intCast(batch_count));
-        var weighted_loss: f64 = 0.0;
-        var weight: f64 = 0.0;
-        var index: u64 = 0;
-        while (index < global_batch_count) : (index += 1) {
-            var prepared: PreparedBatch = undefined;
-            if (index < batch_count) {
-                const local_window_index = std.math.mul(usize, @intCast(index), self.local_batch_size) catch return TrainerError.ValueOverflow;
-                const current_batch_size = @min(self.local_batch_size, rank_bounds.count - local_window_index);
-                const window_index = std.math.add(usize, rank_bounds.start, local_window_index) catch return TrainerError.ValueOverflow;
-                const start = std.math.mul(usize, window_index, window_size) catch return TrainerError.ValueOverflow;
-                const source_length = std.math.mul(usize, current_batch_size, window_size) catch return TrainerError.ValueOverflow;
-                prepared = try self.prepareTokenBatch(dataset.payload[start .. start + source_length], current_batch_size, self.runtime_max_seq_len, 0);
-            } else {
-                prepared = PreparedBatch{
-                    .allocator = self.allocator,
-                    .token_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator),
-                    .active_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator),
-                    .real_sequence_lengths = self.batch_buffers.lengths[0][0..1],
-                    .flat_input_tokens = self.batch_buffers.inputs[0][0..self.runtime_max_seq_len],
-                    .flat_target_tokens = self.batch_buffers.targets[0][0..self.runtime_max_seq_len],
-                    .effective_batch_size = 1,
-                    .sequence_length = 1,
-                    .local_active_samples = 0,
-                    .local_token_count = 0,
-                    .pooled = true,
-                };
-            }
-            defer prepared.deinit();
-            var no_next: ?PreparedBatch = null;
-            const result = try self.trainPreparedStepFuthark(&prepared, null, &no_next);
-            if (no_next) |*next| next.deinit();
-            if (result.sample_weight > 0.0) {
-                weighted_loss += @as(f64, result.loss) * result.sample_weight;
-                weight += result.sample_weight;
-            }
-        }
-        if (weight == 0.0) return 0.0;
-        const loss: f32 = @floatCast(weighted_loss / weight);
-        if (!std.math.isFinite(loss)) return TrainerError.InvalidLoss;
-        _ = epoch;
-        return loss;
-    }
-    fn rankWindowBounds(total: usize, world_size: usize, rank: usize) !struct { start: usize, count: usize } {
-        if (world_size == 0) return TrainerError.InvalidWorldSize;
-        if (rank >= world_size) return TrainerError.InvalidRank;
-        const base = total / world_size;
-        const remainder = total % world_size;
-        const count = base + @intFromBool(rank < remainder);
-        const start = if (rank < remainder)
-            std.math.mul(usize, rank, base + 1) catch return TrainerError.ValueOverflow
-        else
-            std.math.add(
-                usize,
-                std.math.mul(usize, remainder, base + 1) catch return TrainerError.ValueOverflow,
-                std.math.mul(usize, rank - remainder, base) catch return TrainerError.ValueOverflow,
-            ) catch return TrainerError.ValueOverflow;
-        return .{ .start = start, .count = count };
-    }
     fn prepareBatch(self: *DistributedTrainerFuthark, batch: [][]const u8) !PreparedBatch {
         var token_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator);
         errdefer {

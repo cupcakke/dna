@@ -30,7 +30,6 @@ pub const core_relational_z_runtime = @import("core_relational/z_runtime.zig");
 pub const distributed_checkpoint_envelope = @import("distributed/checkpoint_envelope.zig");
 pub const distributed_dataset_partition = @import("distributed/dataset_partition.zig");
 pub const distributed_gpu_coordinator = @import("distributed/gpu_coordinator.zig");
-pub const distributed_mmap_token_dataset = @import("distributed/mmap_token_dataset.zig");
 pub const distributed_modal_gpu = @import("distributed/modal_gpu.zig");
 pub const distributed_nccl_bindings = @import("distributed/nccl_bindings.zig");
 pub const distributed_trainer_futhark = @import("distributed/distributed_trainer_futhark.zig");
@@ -47,7 +46,6 @@ pub const processor_oftb = @import("processor/oftb.zig");
 pub const processor_rsf = @import("processor/rsf.zig");
 pub const ranker_ranker = @import("ranker/ranker.zig");
 pub const tokenizer_mgt = @import("tokenizer/mgt.zig");
-pub const tools_pretokenize = @import("tools/pretokenize.zig");
 
 fn referenceNestedDeclarations(comptime T: type) void {
     @setEvalBranchQuota(10_000_000);
