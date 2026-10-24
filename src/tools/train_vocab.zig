@@ -31,7 +31,26 @@ const Options = struct {
     vocabulary_size: u32,
     corpus_bytes: u64,
     progress_interval_seconds: u64,
+    root_min_frequency: u64,
+    root_capacity_divisor: usize,
+    root_evidence: MGT.RootEvidence,
 };
+
+/// Reads an unsigned environment variable, falling back to `default_value`
+/// when it is unset. A variable that is set to something other than a positive
+/// decimal number is an error: silently keeping the default would make a
+/// misconfigured run look identical to a correctly configured one.
+fn readPositiveEnv(allocator: std.mem.Allocator, comptime name: []const u8, default_value: u64) !u64 {
+    const raw = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return default_value,
+        else => return err,
+    };
+    defer allocator.free(raw);
+
+    const value = std.fmt.parseInt(u64, raw, 10) catch return CliError.InvalidArguments;
+    if (value == 0) return CliError.InvalidArguments;
+    return value;
+}
 
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
@@ -43,7 +62,12 @@ fn printUsage(writer: anytype) !void {
         \\  corpus_bytes     maximum number of corpus bytes to read (default 10485760)
         \\
         \\environment:
-        \\  JAIDE_VOCAB_PROGRESS_SECONDS  progress heartbeat interval in seconds (default 5, 0 disables)
+        \\  JAIDE_VOCAB_PROGRESS_SECONDS         progress heartbeat interval in seconds (default 5, 0 disables)
+        \\  JAIDE_VOCAB_MIN_ROOT_FREQUENCY       corpus frequency a stem needs to become a root (default 2)
+        \\  JAIDE_VOCAB_ROOT_BUDGET_DIVISOR      roots may take 1/N of the free vocabulary capacity (default 8)
+        \\  JAIDE_VOCAB_ROOT_EVIDENCE            paradigm (default) requires a stem to occur in more than one
+        \\                                       shape; frequency mines every stem that reaches the minimum
+        \\                                       frequency, which suits corpora that repeat a fixed phrase list
         \\
     );
 }
@@ -75,12 +99,34 @@ fn parseOptions(allocator: std.mem.Allocator) !Options {
         break :blk std.fmt.parseInt(u64, raw, 10) catch return CliError.InvalidArguments;
     };
 
+    const root_min_frequency = readPositiveEnv(allocator, "JAIDE_VOCAB_MIN_ROOT_FREQUENCY", MGT.default_root_min_frequency) catch |err| switch (err) {
+        CliError.InvalidArguments => return CliError.InvalidArguments,
+        else => return err,
+    };
+    const root_capacity_divisor_u64 = readPositiveEnv(allocator, "JAIDE_VOCAB_ROOT_BUDGET_DIVISOR", MGT.default_root_capacity_divisor) catch |err| switch (err) {
+        CliError.InvalidArguments => return CliError.InvalidArguments,
+        else => return err,
+    };
+    const root_capacity_divisor = std.math.cast(usize, root_capacity_divisor_u64) orelse return CliError.InvalidArguments;
+
+    const root_evidence = blk: {
+        const raw = std.process.getEnvVarOwned(allocator, "JAIDE_VOCAB_ROOT_EVIDENCE") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => break :blk MGT.RootEvidence.paradigm,
+            else => return err,
+        };
+        defer allocator.free(raw);
+        break :blk std.meta.stringToEnum(MGT.RootEvidence, raw) orelse return CliError.InvalidArguments;
+    };
+
     return .{
         .input_path = input_path,
         .output_path = output_path,
         .vocabulary_size = vocabulary_size,
         .corpus_bytes = corpus_bytes,
         .progress_interval_seconds = progress_interval_seconds,
+        .root_min_frequency = root_min_frequency,
+        .root_capacity_divisor = root_capacity_divisor,
+        .root_evidence = root_evidence,
     };
 }
 
@@ -161,12 +207,23 @@ pub fn main() !void {
     var tokenizer = try MGT.init(allocator, &.{}, &.{}, options.vocabulary_size, .english);
     defer tokenizer.deinit();
 
+    try tokenizer.configureRootMining(.{
+        .minimum_frequency = options.root_min_frequency,
+        .capacity_divisor = options.root_capacity_divisor,
+        .evidence = options.root_evidence,
+    });
+
+    try stderr.print(
+        "jaide-vocab-train: morphology policy evidence={s} min_root_frequency={d} root_budget=1/{d}\n",
+        .{ @tagName(options.root_evidence), options.root_min_frequency, options.root_capacity_divisor },
+    );
+
     try tokenizer.trainBPE(corpus.items, options.vocabulary_size);
 
     const reached = tokenizer.next_token_id;
     const root_stats = tokenizer.root_stats;
     try stderr.print(
-        "jaide-vocab-train: trained vocab={d} merges={d} roots={d} anchors={d} words={d} stems={d} added_roots={d}\n",
+        "jaide-vocab-train: trained vocab={d} merges={d} roots={d} anchors={d} words={d} productive_stems={d} added_roots={d}\n",
         .{
             reached,
             tokenizer.bpe_pairs.count(),
@@ -213,21 +270,47 @@ pub fn main() !void {
     var anchors_temporary_is_present = true;
     errdefer if (anchors_temporary_is_present) text_tools.deleteFile(anchors_temporary_path);
 
-    try tokenizer.writeAnchorList(anchors_temporary_path);
-    try text_tools.renameFile(anchors_temporary_path, anchors_path);
-    anchors_temporary_is_present = false;
+    const anchors_written = try tokenizer.writeAnchorList(anchors_temporary_path);
+    if (anchors_written) {
+        try text_tools.renameFile(anchors_temporary_path, anchors_path);
+        anchors_temporary_is_present = false;
+    } else {
+        // The vocabulary carries no anchors, so no list is produced. A stale
+        // list from an earlier run must not survive next to the fresh
+        // vocabulary, because the trainer would then load anchors that this
+        // vocabulary does not contain.
+        text_tools.deleteFile(anchors_temporary_path);
+        anchors_temporary_is_present = false;
+        text_tools.deleteFile(anchors_path);
+    }
 
-    const anchors_file = try text_tools.openRead(anchors_path);
-    defer anchors_file.close();
-    const anchors_size = try anchors_file.getEndPos();
+    const anchors_size = if (anchors_written) blk: {
+        const anchors_file = try text_tools.openRead(anchors_path);
+        defer anchors_file.close();
+        break :blk try anchors_file.getEndPos();
+    } else 0;
+
+    if (root_stats.candidate_stems == 0) {
+        try stderr.print(
+            "jaide-vocab-train: warning: no stem passed the {s} evidence rule in this corpus slice; the morphological layer stays inactive and out-of-vocabulary words are encoded by the byte-pair layer\n",
+            .{@tagName(root_stats.evidence)},
+        );
+    }
 
     const output_file = try text_tools.openRead(options.output_path);
     defer output_file.close();
     const output_size = try output_file.getEndPos();
 
     const elapsed_seconds = @as(f64, @floatFromInt(std.time.nanoTimestamp() - started_ns)) / @as(f64, std.time.ns_per_s);
-    try stderr.print(
-        "jaide-vocab-train: finished vocabulary={d} bytes={d} anchors={s} anchor_bytes={d} elapsed={d:.1}s\n",
-        .{ reached, output_size, anchors_path, anchors_size, elapsed_seconds },
-    );
+    if (anchors_written) {
+        try stderr.print(
+            "jaide-vocab-train: finished vocabulary={d} bytes={d} anchors={s} anchor_bytes={d} elapsed={d:.1}s\n",
+            .{ reached, output_size, anchors_path, anchors_size, elapsed_seconds },
+        );
+    } else {
+        try stderr.print(
+            "jaide-vocab-train: finished vocabulary={d} bytes={d} anchors=none elapsed={d:.1}s\n",
+            .{ reached, output_size, elapsed_seconds },
+        );
+    }
 }

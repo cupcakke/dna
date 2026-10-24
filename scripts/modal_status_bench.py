@@ -64,6 +64,16 @@ PRETOKENIZE_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_TIMEOUT", 
 PRETOKENIZE_STALL_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_STALL", "300"))
 VOCAB_TRAIN_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_VOCAB_TIMEOUT", "1800"))
 VOCAB_CORPUS_BYTES = int(os.environ.get("JAIDE_BENCH_VOCAB_CORPUS_BYTES", "10485760"))
+# Root mining criterion of the morphological layer: "paradigm" only accepts a
+# stem that the corpus shows in more than one shape, "frequency" accepts every
+# stem that reaches JAIDE_VOCAB_MIN_ROOT_FREQUENCY. The strict rule is the
+# default because a corpus of repeated fixed phrases cannot prove a paradigm and
+# the lenient rule would then spend vocabulary slots on truncations.
+VOCAB_ROOT_EVIDENCE = os.environ.get("JAIDE_BENCH_VOCAB_ROOT_EVIDENCE", "paradigm")
+if VOCAB_ROOT_EVIDENCE not in ("paradigm", "frequency"):
+    raise ValueError(
+        "A JAIDE_BENCH_VOCAB_ROOT_EVIDENCE csak 'paradigm' vagy 'frequency' lehet"
+    )
 BUILD_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_BUILD_TIMEOUT", "7200"))
 CPU_REQUEST = float(os.environ.get("JAIDE_BENCH_CPU_REQUEST", "32.0"))
 CPU_LIMIT = float(os.environ.get("JAIDE_BENCH_CPU_LIMIT", "32.0"))
@@ -1137,9 +1147,11 @@ def _prepare_vocabulary(
     _safe_unlink(_anchor_list_path(temporary_destination))
     _log(
         f"Szótár építése a korpuszból: {dataset_path} (cél={VOCAB_SIZE} token, "
-        f"korpusz-szelet={VOCAB_CORPUS_BYTES} bájt)"
+        f"korpusz-szelet={VOCAB_CORPUS_BYTES} bájt, morfológiai bizonyíték={VOCAB_ROOT_EVIDENCE})"
     )
     started = time.time()
+    vocab_env = env.copy()
+    vocab_env["JAIDE_VOCAB_ROOT_EVIDENCE"] = VOCAB_ROOT_EVIDENCE
     try:
         _run(
             [
@@ -1150,7 +1162,7 @@ def _prepare_vocabulary(
                 str(VOCAB_CORPUS_BYTES),
             ],
             cwd=project_dir,
-            env=env,
+            env=vocab_env,
             timeout=VOCAB_TRAIN_TIMEOUT_SEC,
         )
     except BaseException:
@@ -1173,9 +1185,15 @@ def _prepare_vocabulary(
         "origin": "trained_from_corpus",
         "duration_s": round(time.time() - started, 2),
     }
+    result["root_evidence"] = VOCAB_ROOT_EVIDENCE
     anchor_list = _stage_anchor_list(temporary_destination, checkpoint_path)
     if anchor_list is not None:
         result["anchor_list"] = anchor_list
+    else:
+        _log(
+            "A korpusz nem adott morfológiai gyökeret, a szótár anchor-lista nélkül készült; "
+            "a tokenizálás a byte-pár rétegre támaszkodik"
+        )
     return result
 
 

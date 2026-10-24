@@ -150,6 +150,41 @@ test "vocabulary persistence survives a save and load cycle" {
     try std.testing.expectEqual(trained.bpe_pairs.count(), loaded.bpe_pairs.count());
     try std.testing.expectEqual(trained.max_token_len, loaded.max_token_len);
 
+    // The morphological tables travel with the vocabulary: a rank that only
+    // loads the file must decompose and anchor exactly like the trainer that
+    // built it.
+    try std.testing.expectEqual(trained.rootCount(), loaded.rootCount());
+    try std.testing.expectEqual(trained.anchorCount(), loaded.anchorCount());
+
+    var trained_anchor_list = std.ArrayList(u8).init(allocator);
+    defer trained_anchor_list.deinit();
+    var loaded_anchor_list = std.ArrayList(u8).init(allocator);
+    defer loaded_anchor_list.deinit();
+
+    const trained_path = try std.fmt.allocPrint(allocator, "{s}.trained.anchors", .{absolute_path});
+    defer allocator.free(trained_path);
+    const loaded_path = try std.fmt.allocPrint(allocator, "{s}.loaded.anchors", .{absolute_path});
+    defer allocator.free(loaded_path);
+    defer std.fs.deleteFileAbsolute(trained_path) catch {};
+    defer std.fs.deleteFileAbsolute(loaded_path) catch {};
+
+    const trained_wrote = try trained.writeAnchorList(trained_path);
+    const loaded_wrote = try loaded.writeAnchorList(loaded_path);
+    try std.testing.expectEqual(trained_wrote, loaded_wrote);
+
+    if (trained_wrote) {
+        const trained_file = try std.fs.openFileAbsolute(trained_path, .{ .mode = .read_only });
+        defer trained_file.close();
+        try trained_file.reader().readAllArrayList(&trained_anchor_list, 1 * 1024 * 1024);
+
+        const loaded_file = try std.fs.openFileAbsolute(loaded_path, .{ .mode = .read_only });
+        defer loaded_file.close();
+        try loaded_file.reader().readAllArrayList(&loaded_anchor_list, 1 * 1024 * 1024);
+
+        try std.testing.expect(trained_anchor_list.items.len > 0);
+        try std.testing.expectEqualStrings(trained_anchor_list.items, loaded_anchor_list.items);
+    }
+
     const probe = "the spectral fisher diagonalizer conditions the gradient update";
     var trained_tokens = std.ArrayList(u32).init(allocator);
     defer trained_tokens.deinit();
@@ -321,8 +356,10 @@ test "root mining and the anchor list are pure functions of the corpus" {
     var second_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const second_path = try tmp.dir.realpath(second_name, &second_buffer);
 
-    try first.writeAnchorList(first_path);
-    try second.writeAnchorList(second_path);
+    const first_wrote = try first.writeAnchorList(first_path);
+    const second_wrote = try second.writeAnchorList(second_path);
+    try std.testing.expect(first_wrote);
+    try std.testing.expect(second_wrote);
 
     const first_file = try std.fs.openFileAbsolute(first_path, .{ .mode = .read_only });
     defer first_file.close();
@@ -385,4 +422,88 @@ test "anchor positions name the byte offsets of the anchor tokens" {
     for (positions.items) |position| {
         try std.testing.expect(position < text.len);
     }
+}
+
+test "a stem with a single affixed form is not mined" {
+    const allocator = std.testing.allocator;
+
+    const samples = [_][]const u8{
+        "brimtation and the core",
+        "the core carries brimtation once",
+    };
+
+    const corpus = try allocator.alloc([]const u8, 16);
+    for (corpus, 0..) |*slot, index| {
+        slot.* = try allocator.dupe(u8, samples[index % samples.len]);
+    }
+    defer freeCorpus(allocator, corpus);
+
+    var tokenizer = try MGT.init(allocator, &.{}, &.{}, 330, .english);
+    defer tokenizer.deinit();
+    try tokenizer.trainBPE(corpus, 330);
+
+    // "brimtation" splits into the suffix "tion" and the remainder "brimta",
+    // but neither the remainder nor any second affixation of it exists in the
+    // corpus. A miner that trusted a single split would register "brimta" and
+    // spend a vocabulary slot on a truncation; the paradigm requirement rejects
+    // it instead.
+    try std.testing.expectEqual(@as(usize, 0), tokenizer.root_stats.candidate_stems);
+    try std.testing.expectEqual(@as(usize, 0), tokenizer.rootCount());
+    try std.testing.expectEqual(@as(usize, 0), tokenizer.anchorCount());
+    try std.testing.expect(!tokenizer.anchors.contains("brimta"));
+    try std.testing.expect(!tokenizer.token_to_id.contains("brimta"));
+
+    // Encoding still succeeds: the word is handled by the byte-pair layer.
+    var tokens = std.ArrayList(u32).init(allocator);
+    defer tokens.deinit();
+    try tokenizer.encode("brimtation", &tokens);
+    try std.testing.expect(tokens.items.len > 0);
+
+    const decoded = try tokenizer.detokenize(tokens.items);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("brimtation", decoded);
+}
+
+test "a productive english stem is mined and decomposes its inflections" {
+    const allocator = std.testing.allocator;
+
+    const samples = [_][]const u8{
+        "connect the connected encoder and the connecting bridge",
+        "reconnect the reconnected encoder connection",
+        "connect disconnect connected reconnect",
+    };
+
+    const corpus = try allocator.alloc([]const u8, 18);
+    for (corpus, 0..) |*slot, index| {
+        slot.* = try allocator.dupe(u8, samples[index % samples.len]);
+    }
+    defer freeCorpus(allocator, corpus);
+
+    var tokenizer = try MGT.init(allocator, &.{}, &.{}, 360, .english);
+    defer tokenizer.deinit();
+    try tokenizer.trainBPE(corpus, 360);
+
+    // "connect" is attested as a whole word and behind three different affix
+    // combinations, so it is a root; "connec" only ever appears inside
+    // "connection" and "disconnect" inside "disconnect", so neither is mined.
+    try std.testing.expect(tokenizer.rootCount() > 0);
+    try std.testing.expect(tokenizer.anchors.contains("connect"));
+    try std.testing.expect(!tokenizer.anchors.contains("connec"));
+
+    var decomposed = std.ArrayList(u32).init(allocator);
+    defer decomposed.deinit();
+
+    try std.testing.expect(try tokenizer.decompose("reconnected", &decomposed));
+    try std.testing.expectEqual(@as(usize, 3), decomposed.items.len);
+
+    const prefix_text = tokenizer.id_to_token.get(decomposed.items[0]) orelse return error.MissingToken;
+    const root_text = tokenizer.id_to_token.get(decomposed.items[1]) orelse return error.MissingToken;
+    const suffix_text = tokenizer.id_to_token.get(decomposed.items[2]) orelse return error.MissingToken;
+    try std.testing.expectEqualStrings("re", prefix_text);
+    try std.testing.expectEqualStrings("connect", root_text);
+    try std.testing.expectEqualStrings("ed", suffix_text);
+
+    const decoded = try tokenizer.detokenize(decomposed.items);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("reconnected", decoded);
 }

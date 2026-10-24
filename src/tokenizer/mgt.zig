@@ -40,6 +40,12 @@ pub const MGT = struct {
     /// the offline vocabulary trainer reports it, so the share of the
     /// vocabulary that the morphological layer actually owns is observable.
     root_stats: RootMiningStats,
+    /// Minimum corpus frequency a stem needs before it is mined.
+    root_min_frequency: u64,
+    /// Divisor that bounds the root share of the free vocabulary capacity.
+    root_capacity_divisor: usize,
+    /// Criterion the miner applies before it accepts a stem.
+    root_evidence: RootEvidence,
 
     pub const Language = enum {
         english,
@@ -71,15 +77,86 @@ pub const MGT = struct {
         added_roots: usize = 0,
         /// Frequency a stem has to reach before it is mined.
         minimum_frequency: u64 = 0,
+        /// Criterion the pass applied.
+        evidence: RootEvidence = .paradigm,
     };
 
-    /// Share of the remaining capacity the morphological layer may claim
-    /// before byte-pair merges take the rest. Eight means at most one eighth of
-    /// the free slots become roots, so training always has room for merges.
-    const root_capacity_divisor: usize = 8;
+    /// Default share of the remaining capacity the morphological layer may
+    /// claim before byte-pair merges take the rest. Eight means at most one
+    /// eighth of the free slots become roots, so training always has room for
+    /// merges.
+    pub const default_root_capacity_divisor: usize = 8;
 
-    /// A stem must occur at least this many times to be mined.
-    const minimum_root_frequency: u64 = 2;
+    /// Default frequency a stem has to reach before it is mined.
+    pub const default_root_min_frequency: u64 = 2;
+
+    /// Shortest stem the miner accepts. A two-byte stem is almost always the
+    /// residue of an over-eager affix strip, and the tokens it produces are
+    /// shorter than the affixes that created them.
+    pub const minimum_stem_bytes: usize = 3;
+
+    /// Number of distinct affixations the miner remembers per stem. Two are
+    /// enough to prove that a stem is productive; a small bound keeps the
+    /// evidence table proportional to the number of distinct stems.
+    pub const maximum_affixations: usize = 4;
+
+    /// Marker for "this word carries no affix on this side".
+    const absent_affix: u32 = std.math.maxInt(u32);
+
+    /// Criterion a stem has to satisfy before it becomes a root.
+    pub const RootEvidence = enum {
+        /// A stem is mined when the corpus shows it in more than one shape:
+        /// it also occurs as a whole word, or it appears behind at least two
+        /// distinct prefix/suffix combinations. This is the default because it
+        /// never invents a stem out of a single truncated word.
+        paradigm,
+        /// A stem is mined as soon as it reaches the minimum frequency. This is
+        /// the right choice for corpora that repeat a fixed phrase list instead
+        /// of natural text, where no stem can ever collect a paradigm; it can
+        /// produce truncations such as `surpr` from `surprise`, which is why it
+        /// is opt-in.
+        frequency,
+    };
+
+    /// Root mining configuration.
+    pub const RootMiningPolicy = struct {
+        minimum_frequency: u64 = default_root_min_frequency,
+        capacity_divisor: usize = default_root_capacity_divisor,
+        evidence: RootEvidence = .paradigm,
+    };
+
+    /// Morphological evidence collected for one candidate stem.
+    ///
+    /// A stem is only mined when the corpus shows it in more than one shape:
+    /// either it also occurs as a whole word, or it appears behind at least two
+    /// distinct prefix/suffix combinations. Requiring a paradigm is what keeps
+    /// the miner from inventing stems such as `surpr` out of a single word like
+    /// `surprise`: a stem that exists in exactly one affixed form is far more
+    /// likely to be a truncation than a real root, and the token it would
+    /// produce encodes nothing the word itself does not already encode.
+    const StemEvidence = struct {
+        /// Occurrences of this stem inside affixed words.
+        frequency: u64 = 0,
+        /// The stem also occurs as a whole word.
+        standalone: bool = false,
+        /// The stem was seen inside at least one affixed word.
+        from_affixed: bool = false,
+        signatures: [maximum_affixations]u64 = [_]u64{0} ** maximum_affixations,
+        signature_count: usize = 0,
+
+        fn addSignature(self: *StemEvidence, signature: u64) void {
+            for (self.signatures[0..self.signature_count]) |existing| {
+                if (existing == signature) return;
+            }
+            if (self.signature_count == maximum_affixations) return;
+            self.signatures[self.signature_count] = signature;
+            self.signature_count += 1;
+        }
+
+        fn isProductive(self: *const StemEvidence) bool {
+            return self.standalone or self.signature_count >= 2;
+        }
+    };
 
     fn packPair(first: u32, second: u32) u64 {
         return (@as(u64, first) << 32) | @as(u64, second);
@@ -160,6 +237,9 @@ pub const MGT = struct {
             .bpe_output_tokens = std.ArrayList(u32).init(allocator),
             .bpe_pair_cache = std.AutoHashMap(u64, BPEMerge).init(allocator),
             .root_stats = .{},
+            .root_min_frequency = default_root_min_frequency,
+            .root_capacity_divisor = default_root_capacity_divisor,
+            .root_evidence = .paradigm,
         };
     }
 
@@ -918,10 +998,6 @@ pub const MGT = struct {
             self.root_stats = stats;
             return stats;
         }
-        if (token_budget == 0 and self.prefixes.count() == 0 and self.suffixes.count() == 0) {
-            self.root_stats = stats;
-            return stats;
-        }
 
         // The frequency tables are transient: they are released before the
         // merge trainer starts, so the C allocator returns their pages instead
@@ -945,8 +1021,12 @@ pub const MGT = struct {
             }
         }
 
-        var stem_frequencies = std.StringHashMap(u64).init(allocator);
-        defer stem_frequencies.deinit();
+        // One pass over the distinct words collects the paradigm evidence of
+        // every candidate stem. Whole words that carry no affix are only
+        // recorded as supporting evidence; a stem is mined from the affixed
+        // words that contain it.
+        var evidence = std.StringHashMap(StemEvidence).init(allocator);
+        defer evidence.deinit();
 
         var word_iterator = word_frequencies.iterator();
         while (word_iterator.next()) |entry| {
@@ -954,13 +1034,35 @@ pub const MGT = struct {
             const frequency = entry.value_ptr.*;
             if (frequency < minimum_frequency) continue;
 
-            const split = self.splitAffixes(word) orelse continue;
-            const stem = word[split.root_start..split.root_end];
-            if (stem.len < 2) continue;
+            if (self.splitAffixes(word)) |split| {
+                const stem = word[split.root_start..split.root_end];
+                if (stem.len < minimum_stem_bytes) continue;
 
-            const stem_entry = try stem_frequencies.getOrPut(stem);
-            if (!stem_entry.found_existing) stem_entry.value_ptr.* = 0;
-            stem_entry.value_ptr.* = std.math.add(u64, stem_entry.value_ptr.*, frequency) catch return error.FrequencyOverflow;
+                const prefix_id: u32 = if (split.prefix_len == 0)
+                    absent_affix
+                else
+                    self.prefixes.get(word[0..split.prefix_len]) orelse absent_affix;
+                const suffix_id: u32 = if (split.suffix_len == 0)
+                    absent_affix
+                else
+                    self.suffixes.get(word[word.len - split.suffix_len ..]) orelse absent_affix;
+
+                const stem_entry = try evidence.getOrPut(stem);
+                if (!stem_entry.found_existing) stem_entry.value_ptr.* = .{};
+                stem_entry.value_ptr.frequency = std.math.add(u64, stem_entry.value_ptr.frequency, frequency) catch return error.FrequencyOverflow;
+                stem_entry.value_ptr.from_affixed = true;
+                stem_entry.value_ptr.addSignature((@as(u64, prefix_id) << 32) | @as(u64, suffix_id));
+                continue;
+            }
+
+            // A word with no known affix at all proves that its text is a word
+            // in its own right, which is exactly the evidence a stem needs to
+            // be considered productive.
+            if (self.findLongestPrefix(word) == null and self.findLongestSuffix(word) == null) {
+                const stem_entry = try evidence.getOrPut(word);
+                if (!stem_entry.found_existing) stem_entry.value_ptr.* = .{};
+                stem_entry.value_ptr.standalone = true;
+            }
         }
 
         const Candidate = struct {
@@ -971,15 +1073,22 @@ pub const MGT = struct {
         var candidates = std.ArrayList(Candidate).init(allocator);
         defer candidates.deinit();
 
-        var stem_iterator = stem_frequencies.iterator();
-        while (stem_iterator.next()) |entry| {
+        var evidence_iterator = evidence.iterator();
+        while (evidence_iterator.next()) |entry| {
+            const stem_evidence = entry.value_ptr.*;
+            if (!stem_evidence.from_affixed) continue;
+            if (stem_evidence.frequency < minimum_frequency) continue;
+            if (entry.key_ptr.*.len < minimum_stem_bytes) continue;
+            if (self.root_evidence == .paradigm and !stem_evidence.isProductive()) continue;
+
             try candidates.append(.{
                 .stem = entry.key_ptr.*,
-                .frequency = entry.value_ptr.*,
+                .frequency = stem_evidence.frequency,
             });
         }
 
         stats.candidate_stems = candidates.items.len;
+        stats.evidence = self.root_evidence;
 
         // Descending frequency, and the smaller stem text first when two stems
         // are equally frequent. The comparator never depends on the hash-map
@@ -1091,9 +1200,10 @@ pub const MGT = struct {
         // byte-pair merge, and the decomposition branch would stay unused on
         // real text.
         const remaining_capacity = @as(usize, configured_target) - self.vocabSize();
-        const root_budget = remaining_capacity / root_capacity_divisor;
-        if (root_budget > 0) {
-            _ = try self.mineRoots(corpus, root_budget, minimum_root_frequency);
+        const divisor = @max(self.root_capacity_divisor, 1);
+        const root_budget = remaining_capacity / divisor;
+        if (root_budget > 0 and self.root_min_frequency > 0) {
+            _ = try self.mineRoots(corpus, root_budget, self.root_min_frequency);
         }
 
         if (self.vocabSize() >= @as(usize, configured_target)) return;
@@ -1425,6 +1535,31 @@ pub const MGT = struct {
         return self.token_to_id.count();
     }
 
+    /// Sets the root mining policy.
+    ///
+    /// `minimum_frequency` is the corpus frequency a stem needs, and
+    /// `capacity_divisor` bounds the root share of the free vocabulary capacity
+    /// to `1 / capacity_divisor`. Both must be non-zero; a zero divisor would
+    /// let the morphological layer consume the whole vocabulary and leave the
+    /// byte-pair trainer without room for the merges that make the vocabulary
+    /// useful on unseen words.
+    pub fn configureRootMining(self: *MGT, policy: RootMiningPolicy) !void {
+        if (policy.minimum_frequency == 0) return error.InvalidRootMiningPolicy;
+        if (policy.capacity_divisor == 0) return error.InvalidRootMiningPolicy;
+        self.root_min_frequency = policy.minimum_frequency;
+        self.root_capacity_divisor = policy.capacity_divisor;
+        self.root_evidence = policy.evidence;
+    }
+
+    /// Returns the active root mining policy.
+    pub fn rootMiningPolicy(self: *const MGT) RootMiningPolicy {
+        return .{
+            .minimum_frequency = self.root_min_frequency,
+            .capacity_divisor = self.root_capacity_divisor,
+            .evidence = self.root_evidence,
+        };
+    }
+
     /// Number of stems the morphological layer owns.
     pub fn rootCount(self: *const MGT) usize {
         return self.roots.count();
@@ -1452,7 +1587,12 @@ pub const MGT = struct {
     /// morphological roots to every rank without the binary vocabulary format.
     /// Tokens are ordered by id, which makes the file byte-identical for
     /// identical vocabularies.
-    pub fn writeAnchorList(self: *MGT, path: []const u8) !void {
+    ///
+    /// Returns false, and writes nothing at all, when the vocabulary has no
+    /// anchors: the token-list reader rejects an empty file, so creating one
+    /// would turn a legitimate "this corpus had no productive stems" outcome
+    /// into a startup failure for whoever points the trainer at it.
+    pub fn writeAnchorList(self: *MGT, path: []const u8) !bool {
         const AnchorItem = struct {
             key: []const u8,
             value: u64,
@@ -1478,6 +1618,8 @@ pub const MGT = struct {
 
         std.mem.sort(AnchorItem, items.items, AnchorContext{}, AnchorContext.lessThan);
 
+        if (items.items.len == 0) return false;
+
         var file = try core_io.createFilePath(path, .{ .truncate = true });
         defer file.close();
 
@@ -1493,6 +1635,7 @@ pub const MGT = struct {
         }
 
         try buffered.flush();
+        return true;
     }
 
     pub fn addVocabWord(self: *MGT, word: []const u8, is_anchor: bool) !void {

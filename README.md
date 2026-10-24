@@ -36,14 +36,27 @@ zig-out/bin/jaide-vocab-train <corpus.jsonl> <vocab.bin> <vocab_size> [corpus_by
   encodes without falling back to `[UNK]`.
 * The vocabulary is built in a fixed order: four special tokens, the affix
   inventory, every byte token, the morphological roots mined from the corpus
-  (`mineRoots`, at most one eighth of the free capacity) and finally the
-  byte-pair merges up to the requested size. The root set is a pure function of
-  the corpus: stems are ranked by frequency and ties are broken by the stem
-  text, so two runs produce byte-identical vocabularies.
+  (`mineRoots`, at most `1 / JAIDE_VOCAB_ROOT_BUDGET_DIVISOR` of the free
+  capacity, one eighth by default) and finally the byte-pair merges up to the
+  requested size. The root set is a pure function of the corpus: stems are
+  ranked by frequency and ties are broken by the stem text, so two runs produce
+  byte-identical vocabularies.
+* A stem becomes a root only when the corpus shows it in more than one shape:
+  `JAIDE_VOCAB_ROOT_EVIDENCE=paradigm` (default) requires the stem to also occur
+  as a whole word or behind at least two distinct affix combinations, so a
+  single truncated word such as `surprise` can never mint the root `surpr`.
+  `JAIDE_VOCAB_ROOT_EVIDENCE=frequency` mines every stem that reaches
+  `JAIDE_VOCAB_MIN_ROOT_FREQUENCY` (default 2); it exists for corpora that repeat
+  a fixed phrase list, where no paradigm can ever be proven, and it can produce
+  truncations. When no stem passes the rule the tool says so instead of staying
+  silent, and the morphological layer simply stays inactive.
 * Every mined root is stored in the vocabulary's root table and marked as an
-  anchor. The anchor set is saved inside the vocabulary file and additionally
-  exported next to it as `<vocab>.anchors`, a newline-separated token list in the
-  format the distributed trainer reads through `JAIDE_TOKENIZER_ANCHORS`.
+  anchor. Anchors are saved inside the vocabulary file, so every rank that loads
+  the vocabulary has them, and the set is additionally exported next to it as
+  `<vocab>.anchors`, a newline-separated token list in the format the
+  distributed trainer reads through `JAIDE_TOKENIZER_ANCHORS`. No file is written
+  when the vocabulary has no anchors, because the token-list reader rejects an
+  empty file.
 * The tool fails with `VocabularyTargetNotReached` when the corpus does not
   contain enough mergeable pairs for the requested size. Reaching an
   unreachable target silently would produce a vocabulary whose size no longer
@@ -106,6 +119,9 @@ Each of these steps is bounded and observable:
 * `JAIDE_BENCH_VOCAB_TIMEOUT` (default 1800 s) bounds vocabulary training and
   `JAIDE_BENCH_VOCAB_CORPUS_BYTES` (default 10 MiB) bounds how much of the
   corpus it reads.
+* `JAIDE_BENCH_VOCAB_ROOT_EVIDENCE` (`paradigm` by default) selects the root
+  mining rule the vocabulary trainer applies; the chosen value is logged with
+  the vocabulary phase and recorded in the phase report.
 
 The GPU phase then trains with the Futhark-accelerated RSF trainer and smokes the
 inference endpoint. Training itself keeps its own watchdogs
