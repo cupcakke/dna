@@ -64,6 +64,7 @@ PRETOKENIZE_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_TIMEOUT", 
 PRETOKENIZE_STALL_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_STALL", "300"))
 VOCAB_TRAIN_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_VOCAB_TIMEOUT", "1800"))
 VOCAB_CORPUS_BYTES = int(os.environ.get("JAIDE_BENCH_VOCAB_CORPUS_BYTES", "10485760"))
+BUILD_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_BUILD_TIMEOUT", "7200"))
 CPU_REQUEST = float(os.environ.get("JAIDE_BENCH_CPU_REQUEST", "32.0"))
 CPU_LIMIT = float(os.environ.get("JAIDE_BENCH_CPU_LIMIT", "32.0"))
 MEMORY_REQUEST_MB = int(os.environ.get("JAIDE_BENCH_MEMORY_REQUEST", "131072"))
@@ -1308,34 +1309,63 @@ def inspect_prepared_state(run_id: int) -> Dict[str, Any]:
         str(BUILD_MOUNT_PATH): build_volume,
     },
 )
+def _build_gpu_binaries(project_dir: str, env: Dict[str, str]) -> Tuple[int, str, float]:
+    """Lefordítja a GPU fázis binárisait a CPU dolgozón.
+
+    A Futhark CUDA kódgenerálás és a Zig linkelés a CPU image-ben fut, így a
+    drága GPU foglalás csak a tényleges betanítás idejére él. A szótárat és a
+    token datasettet ez a lépés nem érinti.
+    """
+    _log("GPU binárisok fordítása: zig build distributed-futhark inference-server -Dgpu=true")
+    return _run(
+        [
+            "zig",
+            "build",
+            "distributed-futhark",
+            "inference-server",
+            "-Dgpu=true",
+            "-Doptimize=ReleaseSafe",
+        ],
+        cwd=project_dir,
+        env=env,
+        check=False,
+        timeout=BUILD_TIMEOUT_SEC,
+    )
+
+
+def _copy_binary(source: Path, destination: Path, fingerprint: str) -> None:
+    shutil.copy2(str(source), str(destination))
+    os.chmod(str(destination), 0o755)
+    _write_fingerprint(destination, fingerprint)
+
+
 def _stage_available_binaries(
     run_id: int,
     project_dir: str,
     source_fp: str,
     result: Dict[str, Any],
+    env: Dict[str, str],
 ) -> None:
-    """A build volume-ba másolja a rendelkezésre álló GPU binárisokat.
+    """Gondoskodik a GPU fázis binárisairól a build volume-ban.
 
-    A dataset újrahasználata és a binárisok elérhetősége két független kérdés:
-    akkor is fel kell deríteni a binárisokat, ha a token dataset már elkészült,
-    különben a vezérlő folyamat tévesen azt hinné, hogy nincs mit futtatni.
+    A token dataset újrahasználata és a binárisok megléte két független kérdés:
+    akkor is fel kell deríteni (vagy le kell fordítani) a binárisokat, ha a
+    dataset már készen van, különben a vezérlő folyamat tévesen azt hinné, hogy
+    nincs mit futtatni.
     """
-    existing_dist = _find_latest_binary("jaide-distributed-futhark", source_fp)
-    existing_inf = _find_latest_binary("jaide-inference-server", source_fp)
     build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
     build_target_dir.mkdir(parents=True, exist_ok=True)
+    dist_dst = build_target_dir / "jaide-distributed-futhark"
+    inf_dst = build_target_dir / "jaide-inference-server"
 
-    if not FORCE_REBUILD and existing_dist and existing_inf:
-        dist_dst = build_target_dir / "jaide-distributed-futhark"
-        inf_dst = build_target_dir / "jaide-inference-server"
-        shutil.copy2(str(existing_dist), str(dist_dst))
-        os.chmod(str(dist_dst), 0o755)
-        _write_fingerprint(dist_dst, source_fp)
-        shutil.copy2(str(existing_inf), str(inf_dst))
-        os.chmod(str(inf_dst), 0o755)
-        _write_fingerprint(inf_dst, source_fp)
-        _log(f"Legfrissebb lefordított bináris megtalálva: {existing_dist}")
-        _log(f"Legfrissebb inferencia bináris megtalálva: {existing_inf}")
+    cached_dist = None if FORCE_REBUILD else _find_latest_binary("jaide-distributed-futhark", source_fp)
+    cached_inf = None if FORCE_REBUILD else _find_latest_binary("jaide-inference-server", source_fp)
+
+    if cached_dist is not None and cached_inf is not None:
+        _copy_binary(cached_dist, dist_dst, source_fp)
+        _copy_binary(cached_inf, inf_dst, source_fp)
+        _log(f"Legfrissebb lefordított bináris megtalálva: {cached_dist}")
+        _log(f"Legfrissebb inferencia bináris megtalálva: {cached_inf}")
         result["distributed_binary_present"] = True
         result["inference_binary_present"] = True
         result["phases"]["B_gpu_build"] = {
@@ -1343,33 +1373,42 @@ def _stage_available_binaries(
             "inference_build_returncode": 0,
             "distributed_build_returncode": 0,
             "duration_s": 0.0,
-            "reused_binary": str(existing_dist),
+            "reused_binary": str(cached_dist),
         }
-    else:
-        _log("A CPU fázis nem fordít GPU binárisokat; csak az előtokenizált dataset készül.")
+        return
 
-    distributed_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-distributed-futhark"
-    inference_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-inference-server"
+    project_distributed = Path(project_dir) / "zig-out" / "bin" / "jaide-distributed-futhark"
+    project_inference = Path(project_dir) / "zig-out" / "bin" / "jaide-inference-server"
 
-    if distributed_bin.exists():
-        dist_dst = build_target_dir / "jaide-distributed-futhark"
-        shutil.copy2(str(distributed_bin), str(dist_dst))
-        os.chmod(str(dist_dst), 0o755)
-        _write_fingerprint(dist_dst, source_fp)
+    if FORCE_REBUILD or not project_distributed.is_file() or not project_inference.is_file():
+        returncode, build_output, build_duration = _build_gpu_binaries(project_dir, env)
+        result["phases"]["B_gpu_build"] = {
+            "returncode": returncode,
+            "duration_s": round(build_duration, 2),
+            "output_tail": build_output[-4000:],
+        }
+        if returncode != 0:
+            raise RuntimeError(
+                "A GPU binárisok fordítása sikertelen "
+                "(zig build distributed-futhark inference-server -Dgpu=true):\n"
+                + build_output[-4000:]
+            )
+
+    if project_distributed.is_file():
+        _copy_binary(project_distributed, dist_dst, source_fp)
         result["distributed_binary_present"] = True
-    elif not result.get("distributed_binary_present"):
+        _log(f"Disztributált bináris előkészítve: {dist_dst}")
+    else:
         result["distributed_binary_present"] = False
-        _log(f"FIGYELMEZTETÉS: a disztributált bináris nem érhető el innen: {distributed_bin}")
+        _log(f"FIGYELMEZTETÉS: a disztributált bináris nem érhető el innen: {project_distributed}")
 
-    if inference_bin.exists():
-        inf_dst = build_target_dir / "jaide-inference-server"
-        shutil.copy2(str(inference_bin), str(inf_dst))
-        os.chmod(str(inf_dst), 0o755)
-        _write_fingerprint(inf_dst, source_fp)
+    if project_inference.is_file():
+        _copy_binary(project_inference, inf_dst, source_fp)
         result["inference_binary_present"] = True
-    elif not result.get("inference_binary_present"):
+        _log(f"Inferencia bináris előkészítve: {inf_dst}")
+    else:
         result["inference_binary_present"] = False
-        _log(f"FIGYELMEZTETÉS: az inferencia bináris nem érhető el innen: {inference_bin}")
+        _log(f"FIGYELMEZTETÉS: az inferencia bináris nem érhető el innen: {project_inference}")
 
 
 def prepare_cpu(run_id: int) -> Dict[str, Any]:
@@ -1427,7 +1466,7 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
 
     source_fp = _source_fingerprint(Path(project_dir))
     result["source_fingerprint"] = source_fp
-    _stage_available_binaries(run_id, project_dir, source_fp, result)
+    _stage_available_binaries(run_id, project_dir, source_fp, result, env)
 
     existing_dataset_meta = _read_token_dataset_meta(token_dataset_path)
     reuse_blocker: Optional[str] = None
@@ -2222,6 +2261,8 @@ def main() -> None:
         raise ValueError("A JAIDE_BENCH_VOCAB_TIMEOUT értékének pozitívnak kell lennie")
     if VOCAB_CORPUS_BYTES <= 0:
         raise ValueError("A JAIDE_BENCH_VOCAB_CORPUS_BYTES értékének pozitívnak kell lennie")
+    if BUILD_TIMEOUT_SEC <= 0:
+        raise ValueError("A JAIDE_BENCH_BUILD_TIMEOUT értékének pozitívnak kell lennie")
     try:
         reconstruction_alpha_value = float(RECONSTRUCTION_ALPHA)
     except ValueError as exc:
