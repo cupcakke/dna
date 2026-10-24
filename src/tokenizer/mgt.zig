@@ -432,7 +432,9 @@ pub const MGT = struct {
 
             if (self.token_to_id.get(word)) |tid| {
                 try self.emitToken(tid, i, out_tokens, out_anchors);
-            } else if (try self.morphDecompose(word, i, out_tokens, out_anchors)) {} else {
+            } else if (!try self.morphDecompose(word, i, out_tokens, out_anchors)) {
+                // Only words that cannot be explained by a known prefix, root
+                // and suffix combination fall through to the subword layer.
                 try self.subwordSplitInto(word, i, out_tokens, out_anchors);
             }
 
