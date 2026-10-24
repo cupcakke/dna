@@ -1,0 +1,14 @@
+# Zig build outputs
+.zig-cache/
+zig-out/
+
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+.venv/
+.venv-modal/
+
+# Local build artifacts and data produced by the offline tools
+*.tmp
+*.uploading
+*.training
