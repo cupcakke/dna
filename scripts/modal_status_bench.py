@@ -1134,6 +1134,7 @@ def _prepare_vocabulary(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_destination = checkpoint_path.with_name(checkpoint_path.name + ".training")
     _safe_unlink(temporary_destination)
+    _safe_unlink(_anchor_list_path(temporary_destination))
     _log(
         f"Szótár építése a korpuszból: {dataset_path} (cél={VOCAB_SIZE} token, "
         f"korpusz-szelet={VOCAB_CORPUS_BYTES} bájt)"
@@ -1154,13 +1155,15 @@ def _prepare_vocabulary(
         )
     except BaseException:
         _safe_unlink(temporary_destination)
+        _safe_unlink(_anchor_list_path(temporary_destination))
         raise
     trained = _vocabulary_token_count(temporary_destination)
     if trained is None:
         _safe_unlink(temporary_destination)
+        _safe_unlink(_anchor_list_path(temporary_destination))
         raise RuntimeError("A szótárépítés érvénytelen fájlt készített")
     os.replace(temporary_destination, checkpoint_path)
-    return {
+    result: Dict[str, Any] = {
         "source_path": str(dataset_path),
         "destination_path": str(checkpoint_path),
         "bytes": checkpoint_path.stat().st_size,
@@ -1169,6 +1172,46 @@ def _prepare_vocabulary(
         "format": "numeric_pair_keys",
         "origin": "trained_from_corpus",
         "duration_s": round(time.time() - started, 2),
+    }
+    anchor_list = _stage_anchor_list(temporary_destination, checkpoint_path)
+    if anchor_list is not None:
+        result["anchor_list"] = anchor_list
+    return result
+
+
+def _anchor_list_path(vocabulary_path: Path) -> Path:
+    return vocabulary_path.with_name(vocabulary_path.name + ".anchors")
+
+
+def _stage_anchor_list(temporary_destination: Path, checkpoint_path: Path) -> Optional[Dict[str, Any]]:
+    """Moves the anchor list written by the vocabulary trainer next to the
+    final vocabulary.
+
+    The trainer writes the mined morphological roots beside its output file as a
+    newline-separated token list, which is the format the trainer reads through
+    JAIDE_TOKENIZER_ANCHORS. Staging it under the vocabulary's final name keeps
+    the checkpoints volume consistent after the atomic rename of the vocabulary
+    itself, and a missing or empty list is reported as nothing rather than as a
+    failure, because legacy vocabularies simply do not carry one.
+    """
+    temporary_anchors = _anchor_list_path(temporary_destination)
+    if not temporary_anchors.is_file():
+        return None
+    try:
+        data = temporary_anchors.read_bytes()
+    finally:
+        _safe_unlink(temporary_anchors)
+    if not data:
+        return None
+    destination = _anchor_list_path(checkpoint_path)
+    with open(destination, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return {
+        "path": str(destination),
+        "bytes": len(data),
+        "token_count": data.count(b"\n"),
     }
 
 

@@ -1,12 +1,15 @@
 //! Offline vocabulary trainer for the JAIDE tokenizer.
 //!
-//! The tool streams a bounded slice of the JSONL corpus, trains the
-//! Morpho-Graph Tokenizer's byte-pair merges with the tokenizer's own
-//! incremental trainer, verifies that the requested vocabulary size was
-//! reached and writes the result atomically. Running it on a CPU worker keeps
-//! vocabulary construction off the GPU clock, which is why the benchmark
-//! pipeline can prepare everything it needs for training without holding a
-//! GPU allocation.
+//! The tool streams a bounded slice of the JSONL corpus, builds the complete
+//! Morpho-Graph Tokenizer vocabulary with the tokenizer's own trainer (special
+//! tokens, affixes, byte tokens, morphological roots and then byte-pair
+//! merges), verifies that the requested vocabulary size was reached and writes
+//! the result atomically. The morphological roots are additionally exported as
+//! a newline-separated anchor list next to the vocabulary, which is the format
+//! the distributed trainer reads through `JAIDE_TOKENIZER_ANCHORS`. Running
+//! this on a CPU worker keeps vocabulary construction off the GPU clock, which
+//! is why the benchmark pipeline can prepare everything it needs for training
+//! without holding a GPU allocation.
 
 const std = @import("std");
 const MGT = @import("../tokenizer/mgt.zig").MGT;
@@ -161,9 +164,18 @@ pub fn main() !void {
     try tokenizer.trainBPE(corpus.items, options.vocabulary_size);
 
     const reached = tokenizer.next_token_id;
+    const root_stats = tokenizer.root_stats;
     try stderr.print(
-        "jaide-vocab-train: trained vocab={d} merges={d}\n",
-        .{ reached, tokenizer.bpe_pairs.count() },
+        "jaide-vocab-train: trained vocab={d} merges={d} roots={d} anchors={d} words={d} stems={d} added_roots={d}\n",
+        .{
+            reached,
+            tokenizer.bpe_pairs.count(),
+            tokenizer.rootCount(),
+            tokenizer.anchorCount(),
+            root_stats.words,
+            root_stats.candidate_stems,
+            root_stats.added_roots,
+        },
     );
 
     if (reached != options.vocabulary_size) {
@@ -185,13 +197,37 @@ pub fn main() !void {
     try text_tools.renameFile(temporary_path, options.output_path);
     temporary_is_present = false;
 
+    // The anchor list carries the mined roots in the plain token-list format
+    // the distributed trainer reads from JAIDE_TOKENIZER_ANCHORS, so a rank that
+    // builds its tokenizer from a text vocabulary sees exactly the roots this
+    // run mined. It is written after the vocabulary and through the same
+    // temporary-file protocol, so a failed write can never leave a stale list
+    // next to a fresh vocabulary.
+    const anchors_path = try std.fmt.allocPrint(allocator, "{s}.anchors", .{options.output_path});
+    defer allocator.free(anchors_path);
+
+    const anchors_temporary_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{anchors_path});
+    defer allocator.free(anchors_temporary_path);
+    text_tools.deleteFile(anchors_temporary_path);
+
+    var anchors_temporary_is_present = true;
+    errdefer if (anchors_temporary_is_present) text_tools.deleteFile(anchors_temporary_path);
+
+    try tokenizer.writeAnchorList(anchors_temporary_path);
+    try text_tools.renameFile(anchors_temporary_path, anchors_path);
+    anchors_temporary_is_present = false;
+
+    const anchors_file = try text_tools.openRead(anchors_path);
+    defer anchors_file.close();
+    const anchors_size = try anchors_file.getEndPos();
+
     const output_file = try text_tools.openRead(options.output_path);
     defer output_file.close();
     const output_size = try output_file.getEndPos();
 
     const elapsed_seconds = @as(f64, @floatFromInt(std.time.nanoTimestamp() - started_ns)) / @as(f64, std.time.ns_per_s);
     try stderr.print(
-        "jaide-vocab-train: finished vocabulary={d} bytes={d} elapsed={d:.1}s\n",
-        .{ reached, output_size, elapsed_seconds },
+        "jaide-vocab-train: finished vocabulary={d} bytes={d} anchors={s} anchor_bytes={d} elapsed={d:.1}s\n",
+        .{ reached, output_size, anchors_path, anchors_size, elapsed_seconds },
     );
 }

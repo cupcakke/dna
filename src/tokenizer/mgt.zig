@@ -36,6 +36,10 @@ pub const MGT = struct {
     bpe_work_tokens: std.ArrayList(u32),
     bpe_output_tokens: std.ArrayList(u32),
     bpe_pair_cache: std.AutoHashMap(u64, BPEMerge),
+    /// Statistics of the most recent root mining pass. `trainBPE` fills it and
+    /// the offline vocabulary trainer reports it, so the share of the
+    /// vocabulary that the morphological layer actually owns is observable.
+    root_stats: RootMiningStats,
 
     pub const Language = enum {
         english,
@@ -46,6 +50,36 @@ pub const MGT = struct {
         token_id: u32,
         priority: u32,
     };
+
+    /// Affix split of one word: the encoder emits `[prefix][root][suffix]` from
+    /// exactly these offsets, and root mining registers `root` as a vocabulary
+    /// token so the split stays available at encode time.
+    const AffixSplit = struct {
+        prefix_len: usize,
+        suffix_len: usize,
+        root_start: usize,
+        root_end: usize,
+    };
+
+    /// Result of one root mining pass.
+    pub const RootMiningStats = struct {
+        /// Number of word occurrences the pass scanned.
+        words: u64 = 0,
+        /// Number of distinct stems the affix split produced.
+        candidate_stems: usize = 0,
+        /// Number of stems this pass added to the vocabulary.
+        added_roots: usize = 0,
+        /// Frequency a stem has to reach before it is mined.
+        minimum_frequency: u64 = 0,
+    };
+
+    /// Share of the remaining capacity the morphological layer may claim
+    /// before byte-pair merges take the rest. Eight means at most one eighth of
+    /// the free slots become roots, so training always has room for merges.
+    const root_capacity_divisor: usize = 8;
+
+    /// A stem must occur at least this many times to be mined.
+    const minimum_root_frequency: u64 = 2;
 
     fn packPair(first: u32, second: u32) u64 {
         return (@as(u64, first) << 32) | @as(u64, second);
@@ -125,6 +159,7 @@ pub const MGT = struct {
             .bpe_work_tokens = std.ArrayList(u32).init(allocator),
             .bpe_output_tokens = std.ArrayList(u32).init(allocator),
             .bpe_pair_cache = std.AutoHashMap(u64, BPEMerge).init(allocator),
+            .root_stats = .{},
         };
     }
 
@@ -332,6 +367,65 @@ pub const MGT = struct {
         return text[0..boundary];
     }
 
+    /// Span of one word inside an input text.
+    const WordSpan = struct {
+        start: usize,
+        end: usize,
+    };
+
+    /// Returns the next `[start, end)` span the encoder treats as a word and
+    /// advances `position` past it.
+    ///
+    /// Whitespace, punctuation and known special tokens separate words, and the
+    /// same UTF-8 validation the encoder applies is used here. Root mining walks
+    /// the corpus with this function, which is what makes the mined stems agree
+    /// with the fragments the encoder looks up at training time.
+    fn nextWordSpan(self: *const MGT, text: []const u8, position: *usize) ?WordSpan {
+        var cursor = position.*;
+
+        while (cursor < text.len) {
+            if (self.getKnownSpecialTokenLen(text, cursor)) |special_len| {
+                cursor += special_len;
+                continue;
+            }
+
+            const c = text[cursor];
+            if (isWhitespace(c) or isPunctuation(c)) {
+                cursor += 1;
+                continue;
+            }
+
+            break;
+        }
+
+        if (cursor >= text.len) {
+            position.* = text.len;
+            return null;
+        }
+
+        const start = cursor;
+        var end = cursor;
+
+        while (end < text.len) {
+            if (self.isKnownSpecialTokenStart(text, end)) break;
+
+            const c = text[end];
+            if (isWhitespace(c) or isPunctuation(c)) break;
+
+            const char_len = safeUtf8SequenceLenAt(text, end);
+            if (char_len == 0 or char_len > text.len - end) break;
+            end += char_len;
+        }
+
+        if (end == start) {
+            position.* = text.len;
+            return null;
+        }
+
+        position.* = end;
+        return WordSpan{ .start = start, .end = end };
+    }
+
     fn emitToken(self: *const MGT, tid: u32, byte_pos: usize, out_tokens: *std.ArrayList(u32), out_anchors: ?*std.ArrayList(usize)) !void {
         try out_tokens.append(tid);
 
@@ -513,8 +607,16 @@ pub const MGT = struct {
         return null;
     }
 
-    fn morphDecompose(self: *MGT, word: []const u8, word_start: usize, out_tokens: *std.ArrayList(u32), out_anchors: ?*std.ArrayList(usize)) !bool {
-        if (word.len < 4) return false;
+    /// Splits the longest known affixes off `word`.
+    ///
+    /// The split is the single definition of a morphological decomposition in
+    /// this tokenizer: the encoder and the root miner both use it, so a stem
+    /// that is mined from the corpus is exactly the stem the encoder will look
+    /// up later. A word without a known prefix or suffix, a word shorter than
+    /// four bytes, or a word whose stem would be shorter than two bytes has no
+    /// split.
+    fn splitAffixes(self: *MGT, word: []const u8) ?AffixSplit {
+        if (word.len < 4) return null;
 
         const prefix_result = self.findLongestPrefix(word);
         const suffix_result = self.findLongestSuffix(word);
@@ -522,27 +624,49 @@ pub const MGT = struct {
         const prefix_len = if (prefix_result) |prefix| prefix.len else 0;
         const suffix_len = if (suffix_result) |suffix| suffix.len else 0;
 
-        if (prefix_len == 0 and suffix_len == 0) return false;
-        if (prefix_len > word.len or suffix_len > word.len - prefix_len) return false;
+        if (prefix_len == 0 and suffix_len == 0) return null;
+        if (prefix_len > word.len or suffix_len > word.len - prefix_len) return null;
 
         const root_start = prefix_len;
         const root_end = word.len - suffix_len;
 
-        if (root_end <= root_start or root_end - root_start < 2) return false;
+        if (root_end <= root_start or root_end - root_start < 2) return null;
 
-        const root = word[root_start..root_end];
+        return AffixSplit{
+            .prefix_len = prefix_len,
+            .suffix_len = suffix_len,
+            .root_start = root_start,
+            .root_end = root_end,
+        };
+    }
+
+    fn morphDecompose(self: *MGT, word: []const u8, word_start: usize, out_tokens: *std.ArrayList(u32), out_anchors: ?*std.ArrayList(usize)) !bool {
+        const split = self.splitAffixes(word) orelse return false;
+
+        // Every part is resolved before the first token is emitted, so a word
+        // is either decomposed completely or not at all. A partial emission
+        // would desynchronise the token stream from the input text.
+        const root = word[split.root_start..split.root_end];
         const root_tid = self.token_to_id.get(root) orelse return false;
 
-        if (prefix_result) |prefix| {
-            const tid = self.token_to_id.get(prefix.prefix) orelse return false;
+        var prefix_tid: ?u32 = null;
+        if (split.prefix_len > 0) {
+            prefix_tid = self.token_to_id.get(word[0..split.prefix_len]) orelse return false;
+        }
+
+        var suffix_tid: ?u32 = null;
+        if (split.suffix_len > 0) {
+            suffix_tid = self.token_to_id.get(word[word.len - split.suffix_len ..]) orelse return false;
+        }
+
+        if (prefix_tid) |tid| {
             try self.emitToken(tid, word_start, out_tokens, out_anchors);
         }
 
-        try self.emitToken(root_tid, word_start + root_start, out_tokens, out_anchors);
+        try self.emitToken(root_tid, word_start + split.root_start, out_tokens, out_anchors);
 
-        if (suffix_result) |suffix| {
-            const tid = self.token_to_id.get(suffix.suffix) orelse return false;
-            try self.emitToken(tid, word_start + word.len - suffix.len, out_tokens, out_anchors);
+        if (suffix_tid) |tid| {
+            try self.emitToken(tid, word_start + split.root_start + root.len, out_tokens, out_anchors);
         }
 
         return true;
@@ -774,6 +898,125 @@ pub const MGT = struct {
         return next_priority;
     }
 
+    /// Mines the stems of the corpus and registers them as morphological roots.
+    ///
+    /// The pass counts every word, splits it with the same affix inventory the
+    /// encoder uses and accumulates the frequency of the stem that remains.
+    /// Stems that occur at least `minimum_frequency` times are then registered
+    /// in frequency order (ties broken by the stem text, so the outcome is
+    /// independent of hash-map iteration order). A stem that is already a
+    /// vocabulary token becomes a root immediately; other stems are added as
+    /// tokens while `token_budget` and the vocabulary capacity allow it.
+    ///
+    /// Every registered stem is also an anchor, which is what makes the
+    /// morphological layer observable outside this file: the anchor set is
+    /// saved with the vocabulary, can be exported as a token list and marks the
+    /// token positions the encoder reports through `tokenizeWithAnchors`.
+    pub fn mineRoots(self: *MGT, corpus: []const []const u8, token_budget: usize, minimum_frequency: u64) !RootMiningStats {
+        var stats = RootMiningStats{ .minimum_frequency = minimum_frequency };
+        if (minimum_frequency == 0 or corpus.len == 0) {
+            self.root_stats = stats;
+            return stats;
+        }
+        if (token_budget == 0 and self.prefixes.count() == 0 and self.suffixes.count() == 0) {
+            self.root_stats = stats;
+            return stats;
+        }
+
+        // The frequency tables are transient: they are released before the
+        // merge trainer starts, so the C allocator returns their pages instead
+        // of holding them for the rest of the run.
+        const allocator: Allocator = if (@import("builtin").link_libc)
+            std.heap.c_allocator
+        else
+            std.heap.page_allocator;
+
+        var word_frequencies = std.StringHashMap(u64).init(allocator);
+        defer word_frequencies.deinit();
+
+        for (corpus) |text| {
+            var cursor: usize = 0;
+            while (self.nextWordSpan(text, &cursor)) |span| {
+                stats.words = std.math.add(u64, stats.words, 1) catch return error.FrequencyOverflow;
+
+                const entry = try word_frequencies.getOrPut(text[span.start..span.end]);
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                entry.value_ptr.* = std.math.add(u64, entry.value_ptr.*, 1) catch return error.FrequencyOverflow;
+            }
+        }
+
+        var stem_frequencies = std.StringHashMap(u64).init(allocator);
+        defer stem_frequencies.deinit();
+
+        var word_iterator = word_frequencies.iterator();
+        while (word_iterator.next()) |entry| {
+            const word = entry.key_ptr.*;
+            const frequency = entry.value_ptr.*;
+            if (frequency < minimum_frequency) continue;
+
+            const split = self.splitAffixes(word) orelse continue;
+            const stem = word[split.root_start..split.root_end];
+            if (stem.len < 2) continue;
+
+            const stem_entry = try stem_frequencies.getOrPut(stem);
+            if (!stem_entry.found_existing) stem_entry.value_ptr.* = 0;
+            stem_entry.value_ptr.* = std.math.add(u64, stem_entry.value_ptr.*, frequency) catch return error.FrequencyOverflow;
+        }
+
+        const Candidate = struct {
+            stem: []const u8,
+            frequency: u64,
+        };
+
+        var candidates = std.ArrayList(Candidate).init(allocator);
+        defer candidates.deinit();
+
+        var stem_iterator = stem_frequencies.iterator();
+        while (stem_iterator.next()) |entry| {
+            try candidates.append(.{
+                .stem = entry.key_ptr.*,
+                .frequency = entry.value_ptr.*,
+            });
+        }
+
+        stats.candidate_stems = candidates.items.len;
+
+        // Descending frequency, and the smaller stem text first when two stems
+        // are equally frequent. The comparator never depends on the hash-map
+        // layout, so the mined root set is a pure function of the corpus.
+        std.mem.sort(Candidate, candidates.items, {}, struct {
+            fn lessThan(_: void, a: Candidate, b: Candidate) bool {
+                if (a.frequency != b.frequency) return a.frequency > b.frequency;
+                return std.mem.lessThan(u8, a.stem, b.stem);
+            }
+        }.lessThan);
+
+        for (candidates.items) |candidate| {
+            var token_id: u32 = undefined;
+
+            if (self.token_to_id.get(candidate.stem)) |existing_id| {
+                if (self.roots.contains(candidate.stem)) continue;
+                token_id = existing_id;
+            } else {
+                if (stats.added_roots >= token_budget) continue;
+                if (!self.canAddToken()) continue;
+
+                token_id = self.addToken(candidate.stem) catch |err| switch (err) {
+                    error.VocabularyFull => continue,
+                    else => return err,
+                };
+                stats.added_roots += 1;
+            }
+
+            const key = self.id_to_token.get(token_id) orelse return error.InvalidData;
+            try self.roots.put(key, token_id);
+            try self.anchors.put(key, @as(u64, token_id));
+        }
+
+        self.root_stats = stats;
+        return stats;
+    }
+
     const no_node: u32 = std.math.maxInt(u32);
 
     /// One token position inside the linked representation of the training
@@ -805,8 +1048,13 @@ pub const MGT = struct {
 
     const BpeQueue = std.PriorityQueue(BpeCandidate, BpeCandidateOrder, BpeCandidateOrder.lessThan);
 
-    /// Trains byte-pair merges on `corpus` until the vocabulary reaches the
-    /// requested size.
+    /// Builds the complete vocabulary on `corpus`.
+    ///
+    /// The order is fixed and deterministic: the four special tokens and the
+    /// morphemes are already present when this is called, every byte receives a
+    /// dedicated token, the morphological layer mines the stems of the corpus
+    /// (`mineRoots`, bounded to one eighth of the free capacity), and byte-pair
+    /// merges fill the remaining slots up to `target_vocab_size`.
     ///
     /// Pair frequencies are maintained incrementally: every merge only updates
     /// the pair counts that touch the rewritten positions, so a full training
@@ -833,6 +1081,19 @@ pub const MGT = struct {
                 error.VocabularyFull => break,
                 else => return err,
             };
+        }
+
+        if (self.vocabSize() >= @as(usize, configured_target)) return;
+
+        // The morphological layer reserves a bounded share of the remaining
+        // capacity for the stems of the corpus. Without this pass the affix
+        // inventory would only ever match words whose stem happened to be a
+        // byte-pair merge, and the decomposition branch would stay unused on
+        // real text.
+        const remaining_capacity = @as(usize, configured_target) - self.vocabSize();
+        const root_budget = remaining_capacity / root_capacity_divisor;
+        if (root_budget > 0) {
+            _ = try self.mineRoots(corpus, root_budget, minimum_root_frequency);
         }
 
         if (self.vocabSize() >= @as(usize, configured_target)) return;
@@ -1162,6 +1423,76 @@ pub const MGT = struct {
 
     pub fn vocabSize(self: *const MGT) usize {
         return self.token_to_id.count();
+    }
+
+    /// Number of stems the morphological layer owns.
+    pub fn rootCount(self: *const MGT) usize {
+        return self.roots.count();
+    }
+
+    /// Number of anchor tokens in the vocabulary.
+    pub fn anchorCount(self: *const MGT) usize {
+        return self.anchors.count();
+    }
+
+    /// Public entry point of the morphological layer.
+    ///
+    /// Decomposes `word` into `[prefix][root][suffix]` and appends the token ids
+    /// to `out_tokens`. Returns false when the word carries no known affix or
+    /// when the remaining stem is not a vocabulary token, in which case nothing
+    /// is appended and the caller falls back to the subword layer.
+    pub fn decompose(self: *MGT, word: []const u8, out_tokens: *std.ArrayList(u32)) !bool {
+        return self.morphDecompose(word, 0, out_tokens, null);
+    }
+
+    /// Writes the anchor tokens as a newline-separated token list.
+    ///
+    /// This is the format the distributed trainer reads through
+    /// `JAIDE_TOKENIZER_ANCHORS`, so a vocabulary trained offline can hand its
+    /// morphological roots to every rank without the binary vocabulary format.
+    /// Tokens are ordered by id, which makes the file byte-identical for
+    /// identical vocabularies.
+    pub fn writeAnchorList(self: *MGT, path: []const u8) !void {
+        const AnchorItem = struct {
+            key: []const u8,
+            value: u64,
+        };
+
+        const AnchorContext = struct {
+            fn lessThan(_: @This(), a: AnchorItem, b: AnchorItem) bool {
+                if (a.value != b.value) return a.value < b.value;
+                return std.mem.lessThan(u8, a.key, b.key);
+            }
+        };
+
+        var items = std.ArrayList(AnchorItem).init(self.allocator);
+        defer items.deinit();
+
+        var iterator = self.anchors.iterator();
+        while (iterator.next()) |entry| {
+            try items.append(.{
+                .key = entry.key_ptr.*,
+                .value = entry.value_ptr.*,
+            });
+        }
+
+        std.mem.sort(AnchorItem, items.items, AnchorContext{}, AnchorContext.lessThan);
+
+        var file = try core_io.createFilePath(path, .{ .truncate = true });
+        defer file.close();
+
+        var buffered = std.io.bufferedWriter(file.writer());
+        const writer = buffered.writer();
+
+        for (items.items) |item| {
+            // A token that contains a newline could not be read back from a
+            // line-oriented token list, so such a vocabulary is rejected
+            // instead of being written in a form that loses tokens.
+            if (std.mem.indexOfScalar(u8, item.key, '\n') != null) return error.InvalidData;
+            try writer.print("{s}\n", .{item.key});
+        }
+
+        try buffered.flush();
     }
 
     pub fn addVocabWord(self: *MGT, word: []const u8, is_anchor: bool) !void {

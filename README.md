@@ -34,6 +34,16 @@ zig-out/bin/jaide-vocab-train <corpus.jsonl> <vocab.bin> <vocab_size> [corpus_by
   vocabulary encoding and decoding lossless across save/load cycles.
 * All 256 single-byte tokens are always created first, so arbitrary UTF-8 input
   encodes without falling back to `[UNK]`.
+* The vocabulary is built in a fixed order: four special tokens, the affix
+  inventory, every byte token, the morphological roots mined from the corpus
+  (`mineRoots`, at most one eighth of the free capacity) and finally the
+  byte-pair merges up to the requested size. The root set is a pure function of
+  the corpus: stems are ranked by frequency and ties are broken by the stem
+  text, so two runs produce byte-identical vocabularies.
+* Every mined root is stored in the vocabulary's root table and marked as an
+  anchor. The anchor set is saved inside the vocabulary file and additionally
+  exported next to it as `<vocab>.anchors`, a newline-separated token list in the
+  format the distributed trainer reads through `JAIDE_TOKENIZER_ANCHORS`.
 * The tool fails with `VocabularyTargetNotReached` when the corpus does not
   contain enough mergeable pairs for the requested size. Reaching an
   unreachable target silently would produce a vocabulary whose size no longer
@@ -106,7 +116,8 @@ reported by name instead of waiting for the container timeout.
 
 ```sh
 zig build check              # semantic analysis of every module
-zig build test-tokenizer     # tokenizer invariants: training, round-trip, persistence, bounded encoding
+zig build test-tokenizer     # tokenizer invariants: training, round-trip, persistence, bounded encoding,
+                             # root mining, deterministic anchor list, anchor positions
 zig build test-rsf           # RSF tensor, causal and spectral substrate
 zig build test-rsf-native    # accel-free cross-module RSF invariants
 ```
