@@ -77,8 +77,11 @@ pub const MGT = struct {
         added_roots: usize = 0,
         /// Frequency a stem has to reach before it is mined.
         minimum_frequency: u64 = 0,
-        /// Criterion the pass applied.
-        evidence: RootEvidence = .paradigm,
+        /// Criterion the pass applied. Under `auto` this is the rule that
+        /// actually produced the root set, not the configured policy.
+        evidence: RootEvidence = .auto,
+        /// True when `auto` had to fall back from `paradigm` to `frequency`.
+        fell_back: bool = false,
     };
 
     /// Default share of the remaining capacity the morphological layer may
@@ -116,13 +119,20 @@ pub const MGT = struct {
         /// produce truncations such as `surpr` from `surprise`, which is why it
         /// is opt-in.
         frequency,
+        /// `paradigm` first, `frequency` only when the corpus proves no
+        /// paradigm at all. This is the default: on natural text it behaves
+        /// exactly like `paradigm`, and on degenerate corpora (a repeated
+        /// phrase list, a keyword dump) it keeps the morphological layer alive
+        /// instead of silently disabling it. The fallback is recorded in
+        /// `RootMiningStats.fell_back`, so a run never silently changes rule.
+        auto,
     };
 
     /// Root mining configuration.
     pub const RootMiningPolicy = struct {
         minimum_frequency: u64 = default_root_min_frequency,
         capacity_divisor: usize = default_root_capacity_divisor,
-        evidence: RootEvidence = .paradigm,
+        evidence: RootEvidence = .auto,
     };
 
     /// Morphological evidence collected for one candidate stem.
@@ -239,7 +249,7 @@ pub const MGT = struct {
             .root_stats = .{},
             .root_min_frequency = default_root_min_frequency,
             .root_capacity_divisor = default_root_capacity_divisor,
-            .root_evidence = .paradigm,
+            .root_evidence = .auto,
         };
     }
 
@@ -993,19 +1003,47 @@ pub const MGT = struct {
     /// saved with the vocabulary, can be exported as a token list and marks the
     /// token positions the encoder reports through `tokenizeWithAnchors`.
     pub fn mineRoots(self: *MGT, corpus: []const []const u8, token_budget: usize, minimum_frequency: u64) !RootMiningStats {
-        var stats = RootMiningStats{ .minimum_frequency = minimum_frequency };
+        if (self.root_evidence != .auto) {
+            return self.mineRootsWithEvidence(corpus, token_budget, minimum_frequency, self.root_evidence);
+        }
+
+        // `auto` first asks the strict rule. A corpus that proves a paradigm is
+        // the common case on natural text and the strict result is kept as is.
+        const strict = try self.mineRootsWithEvidence(corpus, token_budget, minimum_frequency, .paradigm);
+        if (strict.candidate_stems > 0) return strict;
+
+        // No stem could be proven productive, so the strict rule has no signal
+        // to work with and the lenient rule decides. The fallback is recorded
+        // rather than hidden: callers report it, and a run that used it is
+        // distinguishable from a run that simply found no stems at all.
+        const lenient = try self.mineRootsWithEvidence(corpus, token_budget, minimum_frequency, .frequency);
+        var stats = lenient;
+        stats.fell_back = true;
+        self.root_stats = stats;
+        return stats;
+    }
+
+    /// Runs one mining pass with an explicit evidence rule.
+    fn mineRootsWithEvidence(
+        self: *MGT,
+        corpus: []const []const u8,
+        token_budget: usize,
+        minimum_frequency: u64,
+        evidence: RootEvidence,
+    ) !RootMiningStats {
+        var stats = RootMiningStats{
+            .minimum_frequency = minimum_frequency,
+            .evidence = evidence,
+        };
         if (minimum_frequency == 0 or corpus.len == 0) {
             self.root_stats = stats;
             return stats;
         }
 
         // The frequency tables are transient: they are released before the
-        // merge trainer starts, so the C allocator returns their pages instead
-        // of holding them for the rest of the run.
-        const allocator: Allocator = if (@import("builtin").link_libc)
-            std.heap.c_allocator
-        else
-            std.heap.page_allocator;
+        // merge trainer starts, so the transient allocator returns their pages
+        // instead of holding them for the rest of the run.
+        const allocator = transientAllocator();
 
         var word_frequencies = std.StringHashMap(u64).init(allocator);
         defer word_frequencies.deinit();
@@ -1025,8 +1063,8 @@ pub const MGT = struct {
         // every candidate stem. Whole words that carry no affix are only
         // recorded as supporting evidence; a stem is mined from the affixed
         // words that contain it.
-        var evidence = std.StringHashMap(StemEvidence).init(allocator);
-        defer evidence.deinit();
+        var stem_evidence_table = std.StringHashMap(StemEvidence).init(allocator);
+        defer stem_evidence_table.deinit();
 
         var word_iterator = word_frequencies.iterator();
         while (word_iterator.next()) |entry| {
@@ -1047,7 +1085,7 @@ pub const MGT = struct {
                 else
                     self.suffixes.get(word[word.len - split.suffix_len ..]) orelse absent_affix;
 
-                const stem_entry = try evidence.getOrPut(stem);
+                const stem_entry = try stem_evidence_table.getOrPut(stem);
                 if (!stem_entry.found_existing) stem_entry.value_ptr.* = .{};
                 stem_entry.value_ptr.frequency = std.math.add(u64, stem_entry.value_ptr.frequency, frequency) catch return error.FrequencyOverflow;
                 stem_entry.value_ptr.from_affixed = true;
@@ -1059,7 +1097,7 @@ pub const MGT = struct {
             // in its own right, which is exactly the evidence a stem needs to
             // be considered productive.
             if (self.findLongestPrefix(word) == null and self.findLongestSuffix(word) == null) {
-                const stem_entry = try evidence.getOrPut(word);
+                const stem_entry = try stem_evidence_table.getOrPut(word);
                 if (!stem_entry.found_existing) stem_entry.value_ptr.* = .{};
                 stem_entry.value_ptr.standalone = true;
             }
@@ -1073,13 +1111,13 @@ pub const MGT = struct {
         var candidates = std.ArrayList(Candidate).init(allocator);
         defer candidates.deinit();
 
-        var evidence_iterator = evidence.iterator();
+        var evidence_iterator = stem_evidence_table.iterator();
         while (evidence_iterator.next()) |entry| {
             const stem_evidence = entry.value_ptr.*;
             if (!stem_evidence.from_affixed) continue;
             if (stem_evidence.frequency < minimum_frequency) continue;
             if (entry.key_ptr.*.len < minimum_stem_bytes) continue;
-            if (self.root_evidence == .paradigm and !stem_evidence.isProductive()) continue;
+            if (evidence == .paradigm and !stem_evidence.isProductive()) continue;
 
             try candidates.append(.{
                 .stem = entry.key_ptr.*,
@@ -1088,7 +1126,6 @@ pub const MGT = struct {
         }
 
         stats.candidate_stems = candidates.items.len;
-        stats.evidence = self.root_evidence;
 
         // Descending frequency, and the smaller stem text first when two stems
         // are equally frequent. The comparator never depends on the hash-map
@@ -1124,6 +1161,22 @@ pub const MGT = struct {
 
         self.root_stats = stats;
         return stats;
+    }
+
+    /// Returns the allocator used for the large, short-lived structures of
+    /// training and mining.
+    ///
+    /// They are allocated and released millions of times during a run. The C
+    /// allocator returns freed pages to the operating system, which keeps
+    /// resident memory flat at roughly the size of the corpus representation;
+    /// the page allocator retains the freed mappings and grows resident memory
+    /// by gigabytes on the same work. Binaries that use this trainer link libc,
+    /// and the page allocator remains the fallback for any libc-free consumer.
+    fn transientAllocator() Allocator {
+        return if (@import("builtin").link_libc)
+            std.heap.c_allocator
+        else
+            std.heap.page_allocator;
     }
 
     const no_node: u32 = std.math.maxInt(u32);
@@ -1208,17 +1261,7 @@ pub const MGT = struct {
 
         if (self.vocabSize() >= @as(usize, configured_target)) return;
 
-        // The transient structures of the trainer are allocated and released
-        // millions of times during a run. The C allocator returns freed pages
-        // to the operating system, which keeps resident memory flat at roughly
-        // the size of the corpus representation; the page allocator retains the
-        // freed mappings and grows resident memory by gigabytes on the same
-        // work. Binaries that use this trainer link libc, and the page
-        // allocator remains the fallback for any libc-free consumer.
-        const allocator: Allocator = if (@import("builtin").link_libc)
-            std.heap.c_allocator
-        else
-            std.heap.page_allocator;
+        const allocator = transientAllocator();
 
         var nodes = std.ArrayList(BpeNode).init(allocator);
         defer nodes.deinit();

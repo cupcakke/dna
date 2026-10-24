@@ -65,9 +65,10 @@ fn printUsage(writer: anytype) !void {
         \\  JAIDE_VOCAB_PROGRESS_SECONDS         progress heartbeat interval in seconds (default 5, 0 disables)
         \\  JAIDE_VOCAB_MIN_ROOT_FREQUENCY       corpus frequency a stem needs to become a root (default 2)
         \\  JAIDE_VOCAB_ROOT_BUDGET_DIVISOR      roots may take 1/N of the free vocabulary capacity (default 8)
-        \\  JAIDE_VOCAB_ROOT_EVIDENCE            paradigm (default) requires a stem to occur in more than one
-        \\                                       shape; frequency mines every stem that reaches the minimum
-        \\                                       frequency, which suits corpora that repeat a fixed phrase list
+        \\  JAIDE_VOCAB_ROOT_EVIDENCE            auto (default) uses paradigm and falls back to frequency only
+        \\                                       when the corpus proves no paradigm at all; paradigm requires a
+        \\                                       stem to occur in more than one shape; frequency mines every stem
+        \\                                       that reaches the minimum frequency
         \\
     );
 }
@@ -111,7 +112,7 @@ fn parseOptions(allocator: std.mem.Allocator) !Options {
 
     const root_evidence = blk: {
         const raw = std.process.getEnvVarOwned(allocator, "JAIDE_VOCAB_ROOT_EVIDENCE") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => break :blk MGT.RootEvidence.paradigm,
+            error.EnvironmentVariableNotFound => break :blk (MGT.RootMiningPolicy{}).evidence,
             else => return err,
         };
         defer allocator.free(raw);
@@ -289,6 +290,13 @@ pub fn main() !void {
         defer anchors_file.close();
         break :blk try anchors_file.getEndPos();
     } else 0;
+
+    if (root_stats.fell_back) {
+        try stderr.print(
+            "jaide-vocab-train: the corpus proves no stem paradigm, so the frequency rule decided the root set; roots mined this way can be truncations\n",
+            .{},
+        );
+    }
 
     if (root_stats.candidate_stems == 0) {
         try stderr.print(

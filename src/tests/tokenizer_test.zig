@@ -440,6 +440,7 @@ test "a stem with a single affixed form is not mined" {
 
     var tokenizer = try MGT.init(allocator, &.{}, &.{}, 330, .english);
     defer tokenizer.deinit();
+    try tokenizer.configureRootMining(.{ .evidence = .paradigm });
     try tokenizer.trainBPE(corpus, 330);
 
     // "brimtation" splits into the suffix "tion" and the remainder "brimta",
@@ -486,6 +487,10 @@ test "a productive english stem is mined and decomposes its inflections" {
     // "connect" is attested as a whole word and behind three different affix
     // combinations, so it is a root; "connec" only ever appears inside
     // "connection" and "disconnect" inside "disconnect", so neither is mined.
+    // The default policy is `auto`, and a corpus that proves a paradigm must
+    // never reach the lenient fallback.
+    try std.testing.expect(tokenizer.root_stats.evidence == .paradigm);
+    try std.testing.expect(!tokenizer.root_stats.fell_back);
     try std.testing.expect(tokenizer.rootCount() > 0);
     try std.testing.expect(tokenizer.anchors.contains("connect"));
     try std.testing.expect(!tokenizer.anchors.contains("connec"));
@@ -506,4 +511,113 @@ test "a productive english stem is mined and decomposes its inflections" {
     const decoded = try tokenizer.detokenize(decomposed.items);
     defer allocator.free(decoded);
     try std.testing.expectEqualStrings("reconnected", decoded);
+}
+
+test "auto keeps the morphological layer alive when no paradigm can be proven" {
+    const allocator = std.testing.allocator;
+
+    // A repeated keyword list: every word appears in exactly one shape, so the
+    // strict rule has no evidence to work with. With the default policy the
+    // miner must fall back to the frequency rule instead of leaving the
+    // morphological layer switched off for the whole run.
+    const samples = [_][]const u8{
+        "temporal memory surprise spectral relational gradient",
+        "relational gradient temporal memory surprise spectral",
+    };
+
+    const corpus = try allocator.alloc([]const u8, 20);
+    for (corpus, 0..) |*slot, index| {
+        slot.* = try allocator.dupe(u8, samples[index % samples.len]);
+    }
+    defer freeCorpus(allocator, corpus);
+
+    var tokenizer = try MGT.init(allocator, &.{}, &.{}, 420, .english);
+    defer tokenizer.deinit();
+    try tokenizer.trainBPE(corpus, 420);
+
+    try std.testing.expectEqual(MGT.default_root_capacity_divisor, tokenizer.rootMiningPolicy().capacity_divisor);
+    try std.testing.expect(tokenizer.root_stats.evidence == .frequency);
+    try std.testing.expect(tokenizer.root_stats.fell_back);
+    try std.testing.expect(tokenizer.root_stats.candidate_stems > 0);
+    try std.testing.expectEqual(tokenizer.root_stats.candidate_stems, tokenizer.rootCount());
+    try std.testing.expect(tokenizer.anchorCount() > 0);
+
+    // An explicit policy must not fall back: a caller that asked for the strict
+    // rule gets the strict rule, even when that means no roots at all.
+    var strict = try MGT.init(allocator, &.{}, &.{}, 420, .english);
+    defer strict.deinit();
+    try strict.configureRootMining(.{ .evidence = .paradigm });
+    try strict.trainBPE(corpus, 420);
+
+    try std.testing.expect(strict.root_stats.evidence == .paradigm);
+    try std.testing.expect(!strict.root_stats.fell_back);
+    try std.testing.expectEqual(@as(usize, 0), strict.rootCount());
+    try std.testing.expectEqual(@as(usize, 0), strict.anchorCount());
+}
+
+test "the exported anchor list is accepted by the tokenizer anchor parameter" {
+    const allocator = std.testing.allocator;
+
+    const samples = [_][]const u8{
+        "connect the connected encoder and the connecting bridge",
+        "reconnect the reconnected encoder connection",
+        "connect disconnect connected reconnect",
+    };
+
+    const corpus = try allocator.alloc([]const u8, 18);
+    for (corpus, 0..) |*slot, index| {
+        slot.* = try allocator.dupe(u8, samples[index % samples.len]);
+    }
+    defer freeCorpus(allocator, corpus);
+
+    var trained = try MGT.init(allocator, &.{}, &.{}, 360, .english);
+    defer trained.deinit();
+    try trained.trainBPE(corpus, 360);
+    try std.testing.expect(trained.anchorCount() > 0);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const name = "tokenizer.anchors";
+    {
+        const file = try tmp.dir.createFile(name, .{ .truncate = true });
+        file.close();
+    }
+
+    var absolute_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute_path = try tmp.dir.realpath(name, &absolute_buffer);
+
+    try std.testing.expect(try trained.writeAnchorList(absolute_path));
+
+    const anchor_text = try std.fs.openFileAbsolute(absolute_path, .{ .mode = .read_only });
+    defer anchor_text.close();
+    const content = try anchor_text.readToEndAlloc(allocator, 1 * 1024 * 1024);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.endsWith(u8, content, "\n"));
+
+    // The distributed trainer reads exactly this shape: one token per line. The
+    // lines are collected here and handed to the tokenizer's anchor parameter,
+    // which is the call the trainer makes after loading its own vocabulary.
+    var anchors = std.ArrayList([]const u8).init(allocator);
+    defer anchors.deinit();
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try anchors.append(line);
+    }
+
+    try std.testing.expectEqual(trained.anchorCount(), anchors.items.len);
+    for (anchors.items) |anchor| {
+        try std.testing.expect(trained.token_to_id.contains(anchor));
+    }
+
+    var rebuilt = try MGT.init(allocator, &.{}, anchors.items, 360, .english);
+    defer rebuilt.deinit();
+    try rebuilt.trainBPE(corpus, 360);
+
+    try std.testing.expectEqual(trained.anchorCount(), rebuilt.anchorCount());
+    for (anchors.items) |anchor| {
+        try std.testing.expect(rebuilt.anchors.contains(anchor));
+    }
 }

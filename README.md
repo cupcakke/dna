@@ -41,22 +41,27 @@ zig-out/bin/jaide-vocab-train <corpus.jsonl> <vocab.bin> <vocab_size> [corpus_by
   requested size. The root set is a pure function of the corpus: stems are
   ranked by frequency and ties are broken by the stem text, so two runs produce
   byte-identical vocabularies.
-* A stem becomes a root only when the corpus shows it in more than one shape:
-  `JAIDE_VOCAB_ROOT_EVIDENCE=paradigm` (default) requires the stem to also occur
-  as a whole word or behind at least two distinct affix combinations, so a
-  single truncated word such as `surprise` can never mint the root `surpr`.
-  `JAIDE_VOCAB_ROOT_EVIDENCE=frequency` mines every stem that reaches
-  `JAIDE_VOCAB_MIN_ROOT_FREQUENCY` (default 2); it exists for corpora that repeat
-  a fixed phrase list, where no paradigm can ever be proven, and it can produce
-  truncations. When no stem passes the rule the tool says so instead of staying
-  silent, and the morphological layer simply stays inactive.
+* `JAIDE_VOCAB_ROOT_EVIDENCE` decides which stems may become roots, and the
+  default is `auto`: the strict rule runs first and the lenient one is applied
+  **only** when the corpus proves no paradigm at all. The strict rule
+  (`paradigm`) requires a stem to also occur as a whole word or behind at least
+  two distinct affix combinations, so a single truncated word such as `surprise`
+  can never mint the root `supr`. The lenient rule (`frequency`) mines every
+  stem that reaches `JAIDE_VOCAB_MIN_ROOT_FREQUENCY` (default 2); it is what
+  `auto` falls back to for corpora that repeat a fixed phrase list, where no
+  paradigm can ever exist, and its roots can be truncations. A run that fell
+  back says so on stderr instead of hiding it, and a run whose corpus yields no
+  stem at all reports that too, with the morphological layer staying inactive.
 * Every mined root is stored in the vocabulary's root table and marked as an
   anchor. Anchors are saved inside the vocabulary file, so every rank that loads
   the vocabulary has them, and the set is additionally exported next to it as
   `<vocab>.anchors`, a newline-separated token list in the format the
   distributed trainer reads through `JAIDE_TOKENIZER_ANCHORS`. No file is written
   when the vocabulary has no anchors, because the token-list reader rejects an
-  empty file.
+  empty file. The benchmark pipeline stages that list next to the checkpoint
+  vocabulary and exports it to the training phase, so a tokenizer rebuilt from a
+  token list (the checkpoint-restore path) carries exactly the roots this phase
+  mined.
 * The tool fails with `VocabularyTargetNotReached` when the corpus does not
   contain enough mergeable pairs for the requested size. Reaching an
   unreachable target silently would produce a vocabulary whose size no longer
@@ -119,9 +124,10 @@ Each of these steps is bounded and observable:
 * `JAIDE_BENCH_VOCAB_TIMEOUT` (default 1800 s) bounds vocabulary training and
   `JAIDE_BENCH_VOCAB_CORPUS_BYTES` (default 10 MiB) bounds how much of the
   corpus it reads.
-* `JAIDE_BENCH_VOCAB_ROOT_EVIDENCE` (`paradigm` by default) selects the root
-  mining rule the vocabulary trainer applies; the chosen value is logged with
-  the vocabulary phase and recorded in the phase report.
+* `JAIDE_BENCH_VOCAB_ROOT_EVIDENCE` (`auto` by default) selects the root mining
+  rule the vocabulary trainer applies; the chosen value is logged with the
+  vocabulary phase and recorded in the phase report, and `JAIDE_TOKENIZER_ANCHORS`
+  is exported to the training phase whenever the staged anchor list exists.
 
 The GPU phase then trains with the Futhark-accelerated RSF trainer and smokes the
 inference endpoint. Training itself keeps its own watchdogs

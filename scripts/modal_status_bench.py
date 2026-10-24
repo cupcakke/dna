@@ -66,13 +66,15 @@ VOCAB_TRAIN_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_VOCAB_TIMEOUT", "1800"
 VOCAB_CORPUS_BYTES = int(os.environ.get("JAIDE_BENCH_VOCAB_CORPUS_BYTES", "10485760"))
 # Root mining criterion of the morphological layer: "paradigm" only accepts a
 # stem that the corpus shows in more than one shape, "frequency" accepts every
-# stem that reaches JAIDE_VOCAB_MIN_ROOT_FREQUENCY. The strict rule is the
-# default because a corpus of repeated fixed phrases cannot prove a paradigm and
-# the lenient rule would then spend vocabulary slots on truncations.
-VOCAB_ROOT_EVIDENCE = os.environ.get("JAIDE_BENCH_VOCAB_ROOT_EVIDENCE", "paradigm")
-if VOCAB_ROOT_EVIDENCE not in ("paradigm", "frequency"):
+# stem that reaches JAIDE_VOCAB_MIN_ROOT_FREQUENCY, and "auto" (the default)
+# applies the strict rule and falls back to the lenient one only when the corpus
+# proves no paradigm at all. A corpus of repeated fixed phrases therefore still
+# gets a working morphological layer, while natural text never sees a stem that
+# was mined from a single truncation.
+VOCAB_ROOT_EVIDENCE = os.environ.get("JAIDE_BENCH_VOCAB_ROOT_EVIDENCE", "auto")
+if VOCAB_ROOT_EVIDENCE not in ("auto", "paradigm", "frequency"):
     raise ValueError(
-        "A JAIDE_BENCH_VOCAB_ROOT_EVIDENCE csak 'paradigm' vagy 'frequency' lehet"
+        "A JAIDE_BENCH_VOCAB_ROOT_EVIDENCE csak 'auto', 'paradigm' vagy 'frequency' lehet"
     )
 BUILD_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_BUILD_TIMEOUT", "7200"))
 CPU_REQUEST = float(os.environ.get("JAIDE_BENCH_CPU_REQUEST", "32.0"))
@@ -1233,6 +1235,29 @@ def _stage_anchor_list(temporary_destination: Path, checkpoint_path: Path) -> Op
     }
 
 
+def _export_anchor_list(train_env: Dict[str, str]) -> Optional[Path]:
+    """Adds the staged anchor list of the vocabulary to the training environment.
+
+    The vocabulary file carries the mined morphological roots itself, so every
+    rank that loads the binary vocabulary already has them. The token list exists
+    for the paths that rebuild a tokenizer from a plain word list (the
+    checkpoint-restore stage of the trainer), and those paths read it from
+    JAIDE_TOKENIZER_ANCHORS. Pointing the variable at a file that does not exist
+    would make the trainer fail while rebuilding its tokenizer, so the variable
+    is only set when the staged list is actually present and non-empty.
+    """
+    anchors_file = _anchor_list_path(Path(CHECKPOINT_PATH))
+    if anchors_file.is_file() and anchors_file.stat().st_size > 0:
+        train_env["JAIDE_TOKENIZER_ANCHORS"] = str(anchors_file)
+        _log(
+            f"Morfológiai anchor-lista átadva a tanításnak: {anchors_file} "
+            f"({anchors_file.stat().st_size} bájt)"
+        )
+        return anchors_file
+    train_env.pop("JAIDE_TOKENIZER_ANCHORS", None)
+    return None
+
+
 def _parse_gpu_monitor(text: str) -> Dict[str, Any]:
     samples: Dict[int, Dict[str, List[float]]] = {}
     for row in csv.reader(text.splitlines()):
@@ -1840,6 +1865,7 @@ def run_gpu_train_and_infer(
         train_env["JAIDE_GRAPH_CHUNK_SIZE"] = GRAPH_CHUNK_SIZE
         train_env["JAIDE_INIT_SPECTRAL_ITERS"] = INIT_SPECTRAL_ITERS
         train_env["JAIDE_FUTHARK_UNIFIED_MEMORY"] = "0"
+        _export_anchor_list(train_env)
         vocab_file = Path(CHECKPOINT_PATH)
         if vocab_file.is_file() and vocab_file.stat().st_size > 0:
             train_env["JAIDE_VOCAB_READY"] = "1"

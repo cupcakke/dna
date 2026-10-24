@@ -95,17 +95,21 @@ fn parseOptions(allocator: std.mem.Allocator) !Options {
 
 /// Rejects output paths that alias the corpus or the vocabulary; truncating one
 /// of the inputs would silently corrupt the run.
-fn ensureOutputIsDistinct(options: Options) !void {
+///
+/// Both the destination and its temporary sibling are checked, because the run
+/// writes into `<output>.tmp` first. A candidate that does not exist cannot alias
+/// anything, so it is skipped. The caller's allocator is used so that every
+/// allocation of the process has a single owner.
+fn ensureOutputIsDistinct(allocator: std.mem.Allocator, options: Options) !void {
     const input_file = try text_tools.openRead(options.input_path);
     defer input_file.close();
     const vocabulary_file = try text_tools.openRead(options.vocabulary_path);
     defer vocabulary_file.close();
 
-    const candidates = [_][]const u8{
-        options.output_path,
-        try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp", .{options.output_path}),
-    };
-    defer std.heap.page_allocator.free(candidates[1]);
+    const temporary_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{options.output_path});
+    defer allocator.free(temporary_path);
+
+    const candidates = [_][]const u8{ options.output_path, temporary_path };
 
     for (candidates) |candidate| {
         const existing = text_tools.openRead(candidate) catch continue;
@@ -168,7 +172,7 @@ pub fn main() !void {
         );
     }
 
-    try ensureOutputIsDistinct(options);
+    try ensureOutputIsDistinct(allocator, options);
 
     const input_file = try text_tools.openRead(options.input_path);
     defer input_file.close();
