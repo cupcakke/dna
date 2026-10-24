@@ -142,9 +142,27 @@ pub fn build(b: *std.Build) void {
     pretokenize_exe.linkLibC();
     pretokenize_exe.root_module.addOptions("build_options", build_options);
 
-    b.installArtifact(pretokenize_exe);
+    const pretokenize_install = b.addInstallArtifact(pretokenize_exe, .{});
+    b.getInstallStep().dependOn(&pretokenize_install.step);
+    // The offline pipeline invokes `zig build pretokenize` and then executes
+    // `zig-out/bin/jaide-pretokenize`, so this step must install the artifact
+    // rather than only compiling it into the cache.
     const pretokenize_step = b.step("pretokenize", "Build the binary dataset pre-tokenizer");
-    pretokenize_step.dependOn(&pretokenize_exe.step);
+    pretokenize_step.dependOn(&pretokenize_install.step);
+
+    const vocab_train_exe = b.addExecutable(.{
+        .name = "jaide-vocab-train",
+        .root_source_file = b.path("src/train_vocab_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vocab_train_exe.linkLibC();
+    vocab_train_exe.root_module.addOptions("build_options", build_options);
+
+    const vocab_train_install = b.addInstallArtifact(vocab_train_exe, .{});
+    b.getInstallStep().dependOn(&vocab_train_install.step);
+    const vocab_train_step = b.step("vocab-train", "Build the offline vocabulary trainer");
+    vocab_train_step.dependOn(&vocab_train_install.step);
 
     const c_api_lib = b.addStaticLibrary(.{
         .name = "jaide",
@@ -194,6 +212,19 @@ pub fn build(b: *std.Build) void {
     const run_rsf_substrate_tests = b.addRunArtifact(rsf_substrate_tests);
     const test_rsf_step = b.step("test-rsf", "Run the RSF tensor, causal, and spectral substrate tests");
     test_rsf_step.dependOn(&run_rsf_substrate_tests.step);
+
+    const tokenizer_tests = b.addTest(.{
+        .name = "tokenizer-tests",
+        .root_source_file = b.path("src/tests/tokenizer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tokenizer_tests.linkLibC();
+    tokenizer_tests.root_module.addOptions("build_options", build_options);
+    tokenizer_tests.root_module.addImport("jaide", jaide_mod);
+    const run_tokenizer_tests = b.addRunArtifact(tokenizer_tests);
+    const test_tokenizer_step = b.step("test-tokenizer", "Run the Morpho-Graph Tokenizer invariants");
+    test_tokenizer_step.dependOn(&run_tokenizer_tests.step);
 
     const rsf_native_tests = b.addTest(.{
         .name = "rsf-native-tests",

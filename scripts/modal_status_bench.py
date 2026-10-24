@@ -59,7 +59,11 @@ def _gpu_count_from_spec(spec: str) -> int:
 
 ALLOCATED_GPU_COUNT = _gpu_count_from_spec(GPU_SPEC)
 TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_TIMEOUT", "86400"))
-CPU_TIMEOUT_SEC = int(os.environ.get("JAIDE_CPU_TIMEOUT", "86400"))
+CPU_TIMEOUT_SEC = int(os.environ.get("JAIDE_CPU_TIMEOUT", "14400"))
+PRETOKENIZE_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_TIMEOUT", "7200"))
+PRETOKENIZE_STALL_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_STALL", "300"))
+VOCAB_TRAIN_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_VOCAB_TIMEOUT", "1800"))
+VOCAB_CORPUS_BYTES = int(os.environ.get("JAIDE_BENCH_VOCAB_CORPUS_BYTES", "10485760"))
 CPU_REQUEST = float(os.environ.get("JAIDE_BENCH_CPU_REQUEST", "32.0"))
 CPU_LIMIT = float(os.environ.get("JAIDE_BENCH_CPU_LIMIT", "32.0"))
 MEMORY_REQUEST_MB = int(os.environ.get("JAIDE_BENCH_MEMORY_REQUEST", "131072"))
@@ -130,6 +134,11 @@ SOURCE_FINGERPRINT_PATHS = (
     "src/hw/accel/tensor_core_matmul.zig",
     "src/distributed/distributed_trainer_futhark.zig",
     "src/tokenizer/mgt.zig",
+    "src/tools/pretokenize.zig",
+    "src/tools/train_vocab.zig",
+    "src/tools/dataset_text.zig",
+    "src/pretokenize_main.zig",
+    "src/train_vocab_main.zig",
     "src/distributed/checkpoint_envelope.zig",
     "src/distributed/nccl_bindings.zig",
     "src/main_distributed_futhark.zig",
@@ -584,6 +593,140 @@ def _read_token_dataset_meta(path: Path) -> Optional[Dict[str, int]]:
         return None
 
 
+def _tail_new_log_bytes(log_path: Path, offset: int, prefix: str) -> Tuple[int, bool]:
+    """Kiírja a worker naplójának offset óta keletkezett új sorait.
+
+    A visszatérési érték az új olvasási pozíció, valamint hogy történt-e
+    előrelépés. Az előrelépés-figyelés ezen alapul: ha egy worker hosszú ideig
+    nem ír semmit, akkor a folyamat megakadt, és nem szabad tovább várni rá.
+    """
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return offset, False
+    if size <= offset:
+        return offset, False
+    progressed = True
+    with log_path.open("rb") as handle:
+        handle.seek(offset)
+        chunk = handle.read(min(size - offset, 1024 * 1024))
+        new_offset = offset + len(chunk)
+    if chunk:
+        for line in chunk.decode("utf-8", errors="replace").splitlines():
+            print(f"{prefix} {line}", flush=True)
+    return new_offset, progressed
+
+
+def _merge_pretokenized_parts(
+    part_outputs: List[Path],
+    part_counts: List[int],
+    output_tmp: Path,
+    max_seq_len: int,
+) -> Tuple[int, int]:
+    """A worker kimenetek fejléceit ellenőrzi és egyetlen adathalmazzá fűzi."""
+    part_meta: List[Dict[str, int]] = []
+    total_tokens = 0
+    vocabulary_size = 0
+    maximum_sequence_length = 0
+
+    for index, count in enumerate(part_counts):
+        if count == 0:
+            continue
+        meta = _read_token_dataset_meta(part_outputs[index])
+        if meta is None:
+            raise RuntimeError(f"Hibás worker output: {part_outputs[index]}")
+        expected_tokens = count * (max_seq_len + 1)
+        if meta["total_tokens"] != expected_tokens or meta["maximum_sequence_length"] != max_seq_len:
+            raise RuntimeError(
+                f"A worker output mérete hibás: {part_outputs[index]} "
+                f"(várt tokenek: {expected_tokens}, kapott: {meta['total_tokens']})"
+            )
+        if vocabulary_size == 0:
+            vocabulary_size = meta["vocabulary_size"]
+            maximum_sequence_length = meta["maximum_sequence_length"]
+        elif (
+            vocabulary_size != meta["vocabulary_size"]
+            or maximum_sequence_length != meta["maximum_sequence_length"]
+        ):
+            raise RuntimeError("A worker outputok fejlécei nem egyeznek")
+        total_tokens += meta["total_tokens"]
+        part_meta.append(meta)
+
+    if not part_meta:
+        raise RuntimeError("Egyetlen előtokenizáló worker sem készített kimenetet")
+
+    with output_tmp.open("wb") as target:
+        target.write(
+            struct.pack(
+                "<8sIIQQQQQQ",
+                b"JAIDETOK",
+                1,
+                0,
+                64,
+                total_tokens,
+                vocabulary_size,
+                maximum_sequence_length,
+                0,
+                0,
+            )
+        )
+        for index, count in enumerate(part_counts):
+            if count == 0:
+                continue
+            with part_outputs[index].open("rb") as source:
+                source.seek(part_meta.pop(0)["header_size"])
+                shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
+        target.flush()
+        os.fsync(target.fileno())
+
+    return total_tokens, vocabulary_size
+
+
+def _split_pretokenize_input(
+    input_path: Path,
+    part_inputs: List[Path],
+    samples_per_worker: int,
+    sample_cap: int,
+) -> List[int]:
+    """A korpusz első `sample_cap` nem üres rekordját worker részekre osztja."""
+    part_counts = [0] * len(part_inputs)
+    handles = [path.open("wb") for path in part_inputs]
+    written = 0
+    try:
+        with input_path.open("rb") as source:
+            for raw_line in source:
+                if not raw_line.strip():
+                    continue
+                if written >= sample_cap:
+                    break
+                part_index = min(written // samples_per_worker, len(part_inputs) - 1)
+                handles[part_index].write(raw_line)
+                part_counts[part_index] += 1
+                written += 1
+    finally:
+        for handle in handles:
+            handle.close()
+    if written == 0:
+        raise RuntimeError("A bemeneti dataset nem tartalmaz nem üres rekordot")
+    if written != sample_cap:
+        raise RuntimeError(
+            f"A bemeneti dataset csak {written} nem üres mintát tartalmaz, "
+            f"de {sample_cap} szükséges"
+        )
+    return part_counts
+
+
+def _worker_logs(work_dir: Path, worker_count: int) -> str:
+    chunks: List[str] = []
+    for index in range(worker_count):
+        log_path = work_dir / f"worker-{index:03d}.log"
+        if log_path.is_file():
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+            if content.strip():
+                chunks.append(f"--- worker-{index:03d} ---\n{content}")
+    return "\n".join(chunks) if chunks else "(a workerek nem írtak naplót)"
+
+
 def _parallel_pretokenize(
     pretokenize_bin: Path,
     input_path: Path,
@@ -594,50 +737,48 @@ def _parallel_pretokenize(
     project_dir: str,
     env: Dict[str, str],
     timeout: int,
+    stall_timeout: int,
 ) -> Tuple[int, int, float]:
+    """A korpuszt párhuzamos worker folyamatokkal tokenizálja.
+
+    A függvény folyamatosan figyeli a worker naplókat: minden új sort kiír a
+    Modal naplóba (így a futás soha nem tűnik némán megakadtnak), és ha egy
+    worker a megadott időn belül egyáltalán nem termel kimenetet, akkor leállítja
+    az összes workert és hibát dob a naplók mellékelésével, ahelyett hogy a
+    GPU/CPU foglalás órákig ücsörögne egy megakadt folyamatra várva.
+    """
+    if sample_cap <= 0:
+        raise ValueError("A minta-korlátnak pozitívnak kell lennie")
+    if timeout <= 0:
+        raise ValueError("Az időkorlátnak pozitívnak kell lennie")
+    if stall_timeout <= 0:
+        raise ValueError("A megakadás-figyelő időkorlátnak pozitívnak kell lennie")
+
     worker_setting = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_WORKERS", "16"))
     worker_count = max(1, min(worker_setting, os.cpu_count() or 1, sample_cap))
     samples_per_worker = (sample_cap + worker_count - 1) // worker_count
-    work_dir = Path("/tmp") / f"jaide-pretokenize-{os.getpid()}"
+    work_dir = Path("/tmp") / f"jaide-pretokenize-{os.getpid()}-{int(time.time() * 1000)}"
     work_dir.mkdir(parents=True, exist_ok=True)
-    part_counts = [0] * worker_count
     part_inputs = [work_dir / f"input-{index:03d}.jsonl" for index in range(worker_count)]
     part_outputs = [work_dir / f"output-{index:03d}.bin" for index in range(worker_count)]
-    processes: List[subprocess.Popen[Any]] = []
-    log_files: List[Any] = []
-    t0 = time.time()
+    log_paths = [work_dir / f"worker-{index:03d}.log" for index in range(worker_count)]
+    processes: List[Optional[subprocess.Popen[Any]]] = [None] * worker_count
+    log_handles: List[Any] = []
+    log_offsets = [0] * worker_count
+    part_counts = [0] * worker_count
+    started_at = time.time()
 
     try:
-        handles = [path.open("wb") for path in part_inputs]
-        try:
-            written = 0
-            with input_path.open("rb") as source:
-                for raw_line in source:
-                    if not raw_line.strip():
-                        continue
-                    if written >= sample_cap:
-                        break
-                    part_index = min(written // samples_per_worker, worker_count - 1)
-                    handles[part_index].write(raw_line)
-                    part_counts[part_index] += 1
-                    written += 1
-        finally:
-            for handle in handles:
-                handle.close()
-
-        if written != sample_cap:
-            raise RuntimeError(
-                f"A bemeneti dataset csak {written} nem üres mintát tartalmaz, "
-                f"de {sample_cap} szükséges"
-            )
+        _log(f"Előtokenizálás: {sample_cap} minta {worker_count} workerrel ({samples_per_worker} minta/worker)")
+        part_counts = _split_pretokenize_input(input_path, part_inputs, samples_per_worker, sample_cap)
+        _log(f"Előtokenizálás bemenet felosztva {time.time() - started_at:.1f}s alatt")
 
         for index, count in enumerate(part_counts):
             if count == 0:
                 continue
-            log_path = work_dir / f"worker-{index:03d}.log"
-            log_file = log_path.open("w", encoding="utf-8")
-            log_files.append(log_file)
-            process = subprocess.Popen(
+            log_handle = log_paths[index].open("w", encoding="utf-8")
+            log_handles.append(log_handle)
+            processes[index] = subprocess.Popen(
                 [
                     str(pretokenize_bin),
                     str(part_inputs[index]),
@@ -648,97 +789,114 @@ def _parallel_pretokenize(
                 ],
                 cwd=project_dir,
                 env=env,
-                stdout=log_file,
+                stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            processes.append(process)
 
         deadline = time.monotonic() + timeout
+        last_progress = time.monotonic()
+        last_heartbeat = 0.0
+
         while True:
-            unfinished = [process for process in processes if process.poll() is None]
-            if not unfinished:
+            running = [process for process in processes if process is not None and process.poll() is None]
+            if not running:
                 break
-            if time.monotonic() >= deadline:
-                for process in unfinished:
-                    _terminate_process_group(process)
-                raise RuntimeError("A párhuzamos előtokenizálás túllépte az időkorlátot")
-            time.sleep(0.1)
 
-        failures = [process.returncode for process in processes if process.returncode != 0]
-        if failures:
-            worker_logs = []
+            progressed = False
             for index in range(worker_count):
-                log_path = work_dir / f"worker-{index:03d}.log"
-                if log_path.is_file():
-                    worker_logs.append(log_path.read_text(encoding="utf-8", errors="replace"))
-            raise RuntimeError(
-                f"{len(failures)} előtokenizáló worker hibával állt le:\n"
-                + "\n".join(worker_logs)
-            )
-
-        part_meta: List[Dict[str, int]] = []
-        total_tokens = 0
-        vocabulary_size = 0
-        maximum_sequence_length = 0
-        for index, count in enumerate(part_counts):
-            if count == 0:
-                continue
-            meta = _read_token_dataset_meta(part_outputs[index])
-            if meta is None:
-                raise RuntimeError(f"Hibás worker output: {part_outputs[index]}")
-            expected_tokens = count * (max_seq_len + 1)
-            if (
-                meta["total_tokens"] != expected_tokens
-                or meta["maximum_sequence_length"] != max_seq_len
-            ):
-                raise RuntimeError(
-                    f"A worker output mérete hibás: {part_outputs[index]} "
-                    f"(várt tokenek: {expected_tokens}, kapott: {meta['total_tokens']})"
-                )
-            if vocabulary_size == 0:
-                vocabulary_size = meta["vocabulary_size"]
-                maximum_sequence_length = meta["maximum_sequence_length"]
-            elif (
-                vocabulary_size != meta["vocabulary_size"]
-                or maximum_sequence_length != meta["maximum_sequence_length"]
-            ):
-                raise RuntimeError("A worker outputok fejlécei nem egyeznek")
-            total_tokens += meta["total_tokens"]
-            part_meta.append(meta)
-
-        with output_tmp.open("wb") as target:
-            target.write(
-                struct.pack(
-                    "<8sIIQQQQQQ",
-                    b"JAIDETOK",
-                    1,
-                    0,
-                    64,
-                    total_tokens,
-                    vocabulary_size,
-                    maximum_sequence_length,
-                    0,
-                    0,
-                )
-            )
-            for index, count in enumerate(part_counts):
-                if count == 0:
+                if processes[index] is None:
                     continue
-                with part_outputs[index].open("rb") as source:
-                    source.seek(part_meta.pop(0)["header_size"])
-                    shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
-            target.flush()
-            os.fsync(target.fileno())
+                new_offset, worker_progressed = _tail_new_log_bytes(
+                    log_paths[index],
+                    log_offsets[index],
+                    f"[pretokenize-{index:03d}]",
+                )
+                log_offsets[index] = new_offset
+                progressed = progressed or worker_progressed
 
-        return sample_cap, output_tmp.stat().st_size, time.time() - t0
+            now = time.monotonic()
+            if progressed:
+                last_progress = now
+
+            if now >= deadline:
+                for process in running:
+                    _terminate_process_group(process)
+                raise RuntimeError(
+                    "Az előtokenizálás túllépte a teljes időkorlátot "
+                    f"({timeout}s), a workerek leállítva\n{_worker_logs(work_dir, worker_count)}"
+                )
+
+            if now - last_progress >= stall_timeout:
+                for process in running:
+                    _terminate_process_group(process)
+                raise RuntimeError(
+                    "Az előtokenizálás megakadt: "
+                    f"{stall_timeout}s óta egyetlen worker sem írt kimenetet\n"
+                    f"{_worker_logs(work_dir, worker_count)}"
+                )
+
+            if now - last_heartbeat >= 15.0:
+                last_heartbeat = now
+                alive = len(running)
+                sizes = sum(
+                    part_outputs[index].stat().st_size
+                    for index in range(worker_count)
+                    if part_outputs[index].is_file()
+                )
+                _log(
+                    f"Előtokenizálás fut: {alive}/{worker_count} worker aktív, "
+                    f"kimenet={sizes} bájt, eltelt={now - (deadline - timeout):.1f}s"
+                )
+
+            time.sleep(0.5)
+
+        for index in range(worker_count):
+            new_offset, _ = _tail_new_log_bytes(
+                log_paths[index],
+                log_offsets[index],
+                f"[pretokenize-{index:03d}]",
+            )
+            log_offsets[index] = new_offset
+
+        failures = [
+            (index, process.returncode)
+            for index, process in enumerate(processes)
+            if process is not None and process.returncode not in (0, None)
+        ]
+        if failures:
+            for process in processes:
+                if process is not None and process.poll() is None:
+                    _terminate_process_group(process)
+            raise RuntimeError(
+                f"{len(failures)} előtokenizáló worker hibával állt le: {failures}\n"
+                f"{_worker_logs(work_dir, worker_count)}"
+            )
+
+        total_tokens, vocabulary_size = _merge_pretokenized_parts(
+            part_outputs,
+            part_counts,
+            output_tmp,
+            max_seq_len,
+        )
+
+        elapsed = time.time() - started_at
+        _log(
+            f"Előtokenizálás kész: {sample_cap} minta, {total_tokens} token, "
+            f"szótár={vocabulary_size}, {elapsed:.1f}s "
+            f"({total_tokens / max(elapsed, 1e-9):.0f} token/s)"
+        )
+        return sample_cap, output_tmp.stat().st_size, elapsed
     finally:
         for process in processes:
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 _terminate_process_group(process)
-        for log_file in log_files:
-            log_file.close()
+        for log_handle in log_handles:
+            try:
+                log_handle.close()
+            except OSError:
+                pass
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -851,118 +1009,166 @@ def _reformat_legacy_vocab(path: Path) -> bool:
     return True
 
 
-def _ensure_tokenizer_in_checkpoint() -> Dict[str, Any]:
-    checkpoint_path = Path(CHECKPOINT_PATH)
-    if checkpoint_path.is_file() and checkpoint_path.stat().st_size > 0:
-        if _is_current_vocab_format(checkpoint_path):
-            return {
-                "source_path": str(checkpoint_path),
-                "destination_path": str(checkpoint_path),
-                "bytes": checkpoint_path.stat().st_size,
-                "reused": True,
-                "format": "numeric_pair_keys",
-            }
-        if _reformat_legacy_vocab(checkpoint_path) and _is_current_vocab_format(checkpoint_path):
-            return {
-                "source_path": str(checkpoint_path),
-                "destination_path": str(checkpoint_path),
-                "bytes": checkpoint_path.stat().st_size,
-                "reused": True,
-                "reformatted": True,
-                "format": "numeric_pair_keys",
-            }
-        _log(f"Régi tokenizer-formátum elutasítva és törölve: {checkpoint_path}")
-        checkpoint_path.unlink()
-
-    if not TOKENIZER_SOURCE_PATH.is_file():
-        return {
-            "source_path": None,
-            "destination_path": str(checkpoint_path),
-            "bytes": 0,
-            "reused": False,
-            "format": "rebuild_required",
-        }
-    source_size = TOKENIZER_SOURCE_PATH.stat().st_size
-    if source_size <= 0:
-        raise RuntimeError(f"A projektben lévő tokenizer üres: {TOKENIZER_SOURCE_PATH}")
-    if not _is_current_vocab_format(TOKENIZER_SOURCE_PATH):
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(TOKENIZER_SOURCE_PATH, checkpoint_path)
-        if _reformat_legacy_vocab(checkpoint_path) and _is_current_vocab_format(checkpoint_path):
-            return {
-                "source_path": str(TOKENIZER_SOURCE_PATH),
-                "destination_path": str(checkpoint_path),
-                "bytes": checkpoint_path.stat().st_size,
-                "reused": False,
-                "reformatted": True,
-                "format": "numeric_pair_keys",
-            }
-        checkpoint_path.unlink()
-        raise RuntimeError(f"A legacy tokenizer átalakítása sikertelen: {TOKENIZER_SOURCE_PATH}")
-
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_destination = checkpoint_path.with_name(checkpoint_path.name + ".uploading")
-    _safe_unlink(temporary_destination)
+def _vocabulary_token_count(path: Path) -> Optional[int]:
+    """Visszaadja a szótár tokenjeinek számát, ha a fájl a jelenlegi formátumú."""
+    if not path.is_file() or path.stat().st_size <= 0:
+        return None
+    if not _is_current_vocab_format(path):
+        return None
     try:
-        with TOKENIZER_SOURCE_PATH.open("rb") as source, temporary_destination.open("wb") as target:
-            shutil.copyfileobj(source, target, length=1024 * 1024)
-            target.flush()
-            os.fsync(target.fileno())
-        if temporary_destination.stat().st_size != source_size:
-            raise IOError(
-                "A tokenizer feltöltése hiányos: "
-                f"forrás={source_size} cél={temporary_destination.stat().st_size}"
-            )
-        os.replace(temporary_destination, checkpoint_path)
+        with path.open("rb") as handle:
+            raw = handle.read(4)
+    except OSError:
+        return None
+    if len(raw) != 4:
+        return None
+    token_count = int.from_bytes(raw, "little")
+    if token_count <= 0 or token_count > VOCAB_SIZE:
+        return None
+    return token_count
+
+
+def _ensure_vocab_binary(project_dir: str, env: Dict[str, str]) -> Path:
+    """A `jaide-vocab-train` binárist előállítja, ha még nincs a zig-out alatt."""
+    binary = Path(project_dir) / "zig-out" / "bin" / "jaide-vocab-train"
+    if binary.is_file():
+        return binary
+    _log("A szótárépítő bináris hiányzik, fordítása: zig build vocab-train")
+    _run(
+        ["zig", "build", "vocab-train", "-Doptimize=ReleaseSafe", "-Dskip-futhark=true"],
+        cwd=project_dir,
+        env=env,
+        timeout=CPU_TIMEOUT_SEC,
+    )
+    if not binary.is_file():
+        raise RuntimeError(f"A szótárépítő bináris hiányzik: {binary}")
+    return binary
+
+
+def _prepare_vocabulary(
+    dataset_path: Path,
+    project_dir: str,
+    env: Dict[str, str],
+) -> Dict[str, Any]:
+    """Gondoskodik arról, hogy a checkpoint kötetben érvényes szótár legyen.
+
+    A szótárat CPU-n, a korpusz egy korlátozott szeletéből építjük fel, így a
+    GPU fázis soha nem tölt időt szótárépítéssel, és a teljes előkészítés
+    reprodukálható: ugyanaz a korpusz-szelet mindig ugyanazt a szótárat adja.
+    """
+    checkpoint_path = Path(CHECKPOINT_PATH)
+
+    existing = _vocabulary_token_count(checkpoint_path)
+    if existing is not None:
+        return {
+            "source_path": str(checkpoint_path),
+            "destination_path": str(checkpoint_path),
+            "bytes": checkpoint_path.stat().st_size,
+            "token_count": existing,
+            "reused": True,
+            "format": "numeric_pair_keys",
+            "origin": "checkpoint_volume",
+        }
+
+    if checkpoint_path.is_file():
+        if _reformat_legacy_vocab(checkpoint_path):
+            converted = _vocabulary_token_count(checkpoint_path)
+            if converted is not None:
+                return {
+                    "source_path": str(checkpoint_path),
+                    "destination_path": str(checkpoint_path),
+                    "bytes": checkpoint_path.stat().st_size,
+                    "token_count": converted,
+                    "reused": True,
+                    "reformatted": True,
+                    "format": "numeric_pair_keys",
+                    "origin": "checkpoint_volume",
+                }
+        _log(f"Érvénytelen vagy régi formátumú szótár törlése: {checkpoint_path}")
+        checkpoint_path.unlink()
+
+    source_path = TOKENIZER_SOURCE_PATH
+    if source_path.is_file() and source_path.stat().st_size > 0:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_destination = checkpoint_path.with_name(checkpoint_path.name + ".uploading")
+        _safe_unlink(temporary_destination)
+        try:
+            with source_path.open("rb") as source, temporary_destination.open("wb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary_destination, checkpoint_path)
+        except BaseException:
+            _safe_unlink(temporary_destination)
+            raise
+
+        imported = _vocabulary_token_count(checkpoint_path)
+        if imported is not None:
+            return {
+                "source_path": str(source_path),
+                "destination_path": str(checkpoint_path),
+                "bytes": checkpoint_path.stat().st_size,
+                "token_count": imported,
+                "reused": False,
+                "format": "numeric_pair_keys",
+                "origin": "project_vocabulary",
+            }
+        if not _reformat_legacy_vocab(checkpoint_path):
+            raise RuntimeError(f"A projektben lévő szótár átalakítása sikertelen: {source_path}")
+        converted = _vocabulary_token_count(checkpoint_path)
+        if converted is None:
+            raise RuntimeError(f"A projektben lévő szótár érvénytelen: {source_path}")
+        return {
+            "source_path": str(source_path),
+            "destination_path": str(checkpoint_path),
+            "bytes": checkpoint_path.stat().st_size,
+            "token_count": converted,
+            "reused": False,
+            "reformatted": True,
+            "format": "numeric_pair_keys",
+            "origin": "project_vocabulary",
+        }
+
+    vocab_bin = _ensure_vocab_binary(project_dir, env)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_destination = checkpoint_path.with_name(checkpoint_path.name + ".training")
+    _safe_unlink(temporary_destination)
+    _log(
+        f"Szótár építése a korpuszból: {dataset_path} (cél={VOCAB_SIZE} token, "
+        f"korpusz-szelet={VOCAB_CORPUS_BYTES} bájt)"
+    )
+    started = time.time()
+    try:
+        _run(
+            [
+                str(vocab_bin),
+                str(dataset_path),
+                str(temporary_destination),
+                str(VOCAB_SIZE),
+                str(VOCAB_CORPUS_BYTES),
+            ],
+            cwd=project_dir,
+            env=env,
+            timeout=VOCAB_TRAIN_TIMEOUT_SEC,
+        )
     except BaseException:
         _safe_unlink(temporary_destination)
         raise
-
+    trained = _vocabulary_token_count(temporary_destination)
+    if trained is None:
+        _safe_unlink(temporary_destination)
+        raise RuntimeError("A szótárépítés érvénytelen fájlt készített")
+    os.replace(temporary_destination, checkpoint_path)
     return {
-        "source_path": str(TOKENIZER_SOURCE_PATH),
+        "source_path": str(dataset_path),
         "destination_path": str(checkpoint_path),
-        "bytes": source_size,
+        "bytes": checkpoint_path.stat().st_size,
+        "token_count": trained,
         "reused": False,
         "format": "numeric_pair_keys",
+        "origin": "trained_from_corpus",
+        "duration_s": round(time.time() - started, 2),
     }
-
-
-def _run_futhark_kernels(project_dir: str, env: Dict[str, str]) -> None:
-    accel_dir = os.path.join(project_dir, "src", "hw", "accel")
-    _log("Futhark csomagok szinkronizálása")
-    _run(
-        ["futhark", "pkg", "sync"],
-        cwd=accel_dir,
-        env=env,
-        check=False,
-        timeout=180,
-    )
-    _log("Futhark CPU könyvtár fordítása")
-    _run(
-        [
-            "futhark",
-            "c",
-            "--library",
-            os.path.join(accel_dir, "futhark_kernels.fut"),
-            "-o",
-            os.path.join(accel_dir, "futhark_kernels"),
-        ],
-        cwd=project_dir,
-        env=env,
-    )
-    _log("Futhark CUDA könyvtár fordítása")
-    _run(
-        [
-            "futhark",
-            "cuda",
-            "--library",
-            os.path.join(accel_dir, "main.fut"),
-            "-o",
-            os.path.join(accel_dir, "main_gpu"),
-        ],
-        cwd=project_dir,
-        env=env,
-    )
 
 
 def _parse_gpu_monitor(text: str) -> Dict[str, Any]:
@@ -1102,7 +1308,77 @@ def inspect_prepared_state(run_id: int) -> Dict[str, Any]:
         str(BUILD_MOUNT_PATH): build_volume,
     },
 )
+def _stage_available_binaries(
+    run_id: int,
+    project_dir: str,
+    source_fp: str,
+    result: Dict[str, Any],
+) -> None:
+    """A build volume-ba másolja a rendelkezésre álló GPU binárisokat.
+
+    A dataset újrahasználata és a binárisok elérhetősége két független kérdés:
+    akkor is fel kell deríteni a binárisokat, ha a token dataset már elkészült,
+    különben a vezérlő folyamat tévesen azt hinné, hogy nincs mit futtatni.
+    """
+    existing_dist = _find_latest_binary("jaide-distributed-futhark", source_fp)
+    existing_inf = _find_latest_binary("jaide-inference-server", source_fp)
+    build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
+    build_target_dir.mkdir(parents=True, exist_ok=True)
+
+    if not FORCE_REBUILD and existing_dist and existing_inf:
+        dist_dst = build_target_dir / "jaide-distributed-futhark"
+        inf_dst = build_target_dir / "jaide-inference-server"
+        shutil.copy2(str(existing_dist), str(dist_dst))
+        os.chmod(str(dist_dst), 0o755)
+        _write_fingerprint(dist_dst, source_fp)
+        shutil.copy2(str(existing_inf), str(inf_dst))
+        os.chmod(str(inf_dst), 0o755)
+        _write_fingerprint(inf_dst, source_fp)
+        _log(f"Legfrissebb lefordított bináris megtalálva: {existing_dist}")
+        _log(f"Legfrissebb inferencia bináris megtalálva: {existing_inf}")
+        result["distributed_binary_present"] = True
+        result["inference_binary_present"] = True
+        result["phases"]["B_gpu_build"] = {
+            "returncode": 0,
+            "inference_build_returncode": 0,
+            "distributed_build_returncode": 0,
+            "duration_s": 0.0,
+            "reused_binary": str(existing_dist),
+        }
+    else:
+        _log("A CPU fázis nem fordít GPU binárisokat; csak az előtokenizált dataset készül.")
+
+    distributed_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-distributed-futhark"
+    inference_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-inference-server"
+
+    if distributed_bin.exists():
+        dist_dst = build_target_dir / "jaide-distributed-futhark"
+        shutil.copy2(str(distributed_bin), str(dist_dst))
+        os.chmod(str(dist_dst), 0o755)
+        _write_fingerprint(dist_dst, source_fp)
+        result["distributed_binary_present"] = True
+    elif not result.get("distributed_binary_present"):
+        result["distributed_binary_present"] = False
+        _log(f"FIGYELMEZTETÉS: a disztributált bináris nem érhető el innen: {distributed_bin}")
+
+    if inference_bin.exists():
+        inf_dst = build_target_dir / "jaide-inference-server"
+        shutil.copy2(str(inference_bin), str(inf_dst))
+        os.chmod(str(inf_dst), 0o755)
+        _write_fingerprint(inf_dst, source_fp)
+        result["inference_binary_present"] = True
+    elif not result.get("inference_binary_present"):
+        result["inference_binary_present"] = False
+        _log(f"FIGYELMEZTETÉS: az inferencia bináris nem érhető el innen: {inference_bin}")
+
+
 def prepare_cpu(run_id: int) -> Dict[str, Any]:
+    """A CPU fázis: szótár, binárisok és előtokenizált dataset előállítása.
+
+    A függvény minden lépésnél naplóz, minden hosszú műveletnek külön
+    időkorlátja és megakadás-figyelője van, és a meglévő token datasettet csak
+    akkor írja felül, ha az új változat hibátlanul elkészült.
+    """
     build_volume.reload()
     data_volume.reload()
     checkpoint_volume.reload()
@@ -1120,16 +1396,61 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     }
     token_dataset_path = Path(TOKEN_DATASET_PATH)
 
+    _log("=" * 70)
+    _log(f"CPU ELŐKÉSZÍTÉSI FÁZIS run_id={run_id}")
+    _log("=" * 70)
+
+    dataset_path = Path(DATASET_PATH)
+    if not dataset_path.is_file() or dataset_path.stat().st_size <= 0:
+        raise RuntimeError(
+            "A Modal jaide-bench-data volume datasetje hiányzik vagy üres: "
+            f"{dataset_path}. A benchmark nem tölt le másik adathalmazt."
+        )
+    _log(f"Modal volume dataset használata: {dataset_path} ({dataset_path.stat().st_size} bájt)")
+
+    tokenizer_checkpoint = _prepare_vocabulary(dataset_path, project_dir, env)
+    if tokenizer_checkpoint["token_count"] != VOCAB_SIZE:
+        raise RuntimeError(
+            "A rendelkezésre álló szótár mérete nem egyezik a kért JAIDE_BENCH_VOCAB_SIZE értékkel: "
+            f"{tokenizer_checkpoint['token_count']} != {VOCAB_SIZE}. "
+            "Állítsd a JAIDE_BENCH_VOCAB_SIZE-t a szótár méretére, vagy töröld a szótárt, "
+            "hogy újraépüljön a korpuszból."
+        )
+    checkpoint_volume.commit()
+    result["tokenizer_checkpoint"] = tokenizer_checkpoint
+    result["vocabulary_size"] = tokenizer_checkpoint["token_count"]
+    _log(
+        f"Szótár kész ({tokenizer_checkpoint['origin']}): "
+        f"{tokenizer_checkpoint['destination_path']} "
+        f"({tokenizer_checkpoint['token_count']} token, {tokenizer_checkpoint['bytes']} bájt)"
+    )
+
+    source_fp = _source_fingerprint(Path(project_dir))
+    result["source_fingerprint"] = source_fp
+    _stage_available_binaries(run_id, project_dir, source_fp, result)
+
     existing_dataset_meta = _read_token_dataset_meta(token_dataset_path)
+    reuse_blocker: Optional[str] = None
     if existing_dataset_meta is not None:
         window_length = existing_dataset_meta["maximum_sequence_length"] + 1
         if existing_dataset_meta["total_tokens"] % window_length != 0:
             raise RuntimeError(
                 f"A kész token dataset token-száma nem osztható a mintablokk méretével: {token_dataset_path}"
             )
+        if existing_dataset_meta["vocabulary_size"] != tokenizer_checkpoint["token_count"]:
+            reuse_blocker = (
+                "a meglévő dataset szótármérete "
+                f"{existing_dataset_meta['vocabulary_size']} != {tokenizer_checkpoint['token_count']}"
+            )
+        elif existing_dataset_meta["maximum_sequence_length"] != MAX_SEQ_LEN:
+            reuse_blocker = (
+                "a meglévő dataset szekvenciahossza "
+                f"{existing_dataset_meta['maximum_sequence_length']} != {MAX_SEQ_LEN}"
+            )
+
+    if existing_dataset_meta is not None and reuse_blocker is None:
+        window_length = existing_dataset_meta["maximum_sequence_length"] + 1
         sample_count = existing_dataset_meta["total_tokens"] // window_length
-        result["distributed_binary_present"] = False
-        result["inference_binary_present"] = False
         result["phases"]["C_prep_dataset"] = {
             "duration_s": 0.0,
             "sample_count": sample_count,
@@ -1139,112 +1460,28 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
             "source": "modal_volume:jaide-bench-data",
             "pretokenized": True,
             "reused": True,
+            "vocabulary_size": tokenizer_checkpoint["token_count"],
+            "maximum_sequence_length": existing_dataset_meta["maximum_sequence_length"],
         }
         _log(
-            f"A végleges bináris dataset már létezik, újrahasználva: "
-            f"{sample_count} minta, {token_dataset_path.stat().st_size} bájt"
+            f"A végleges bináris dataset már létezik és illeszkedik a szótárhoz, "
+            f"újrahasználva: {sample_count} minta, {token_dataset_path.stat().st_size} bájt"
         )
+        build_volume.commit()
         report_volume.commit()
         return result
 
-    _log("=" * 70)
-    _log(f"CPU ELŐKÉSZÍTÉSI FÁZIS run_id={run_id}")
-    _log("=" * 70)
-
-    tokenizer_checkpoint = _ensure_tokenizer_in_checkpoint()
-    checkpoint_volume.commit()
-    result["tokenizer_checkpoint"] = tokenizer_checkpoint
-    if tokenizer_checkpoint["reused"]:
-        _log(
-            f"Modal checkpoint tokenizer használata: {tokenizer_checkpoint['destination_path']} "
-            f"({tokenizer_checkpoint['bytes']} bájt, meglévő fájl)"
-        )
-    elif tokenizer_checkpoint["format"] == "rebuild_required":
-        _log(
-            "A tokenizer régi vagy hiányzó formátumú; a GPU folyamat a vocabot "
-            "újraépíti a benchmark-adatkészletből"
-        )
-    else:
-        _log(
-            f"Tokenizer feltöltve a Modal checkpoint kötetbe: "
-            f"{tokenizer_checkpoint['source_path']} -> {tokenizer_checkpoint['destination_path']} "
-            f"({tokenizer_checkpoint['bytes']} bájt)"
-        )
-
-    dataset_path = Path(DATASET_PATH)
-    if not dataset_path.is_file() or dataset_path.stat().st_size <= 0:
-        raise RuntimeError(
-            "A Modal jaide-bench-data volume datasetje hiányzik vagy üres: "
-            f"{dataset_path}. A benchmark nem tölt le másik adathalmazt."
-        )
-    _log(f"Modal volume dataset használata: {dataset_path} ({dataset_path.stat().st_size} bájt)")
-    source_fp = _source_fingerprint(Path(project_dir))
-    result["source_fingerprint"] = source_fp
-    existing_dist = _find_latest_binary("jaide-distributed-futhark", source_fp)
-    existing_inf = _find_latest_binary("jaide-inference-server", source_fp)
-    cached_binaries_reused = False
-    if not FORCE_REBUILD and existing_dist and existing_inf:
-        _log(f"Legfrissebb lefordított bináris megtalálva: {existing_dist}")
-        _log(f"Legfrissebb inferencia bináris megtalálva: {existing_inf}")
-        _log("A GPU binárisok újrafordítása átugorva; csak a dataset készül elő.")
-        build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
-        build_target_dir.mkdir(parents=True, exist_ok=True)
-        dist_dst = build_target_dir / "jaide-distributed-futhark"
-        inf_dst = build_target_dir / "jaide-inference-server"
-        shutil.copy2(str(existing_dist), str(dist_dst))
-        os.chmod(str(dist_dst), 0o755)
-        _write_fingerprint(dist_dst, source_fp)
-        shutil.copy2(str(existing_inf), str(inf_dst))
-        os.chmod(str(inf_dst), 0o755)
-        _write_fingerprint(inf_dst, source_fp)
-
-        result["distributed_binary_present"] = True
-        result["inference_binary_present"] = True
-        cached_binaries_reused = True
-        result["phases"]["B_gpu_build"] = {
-            "returncode": 0,
-            "inference_build_returncode": 0,
-            "distributed_build_returncode": 0,
-            "duration_s": 0.0,
-            "reused_binary": str(existing_dist),
-        }
-    if not cached_binaries_reused:
-        _log("A prep nem fordít GPU binárisokat; csak az előtokenizált dataset készül.")
-        result["distributed_binary_present"] = False
-        result["inference_binary_present"] = False
-
-    inference_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-inference-server"
-    distributed_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-distributed-futhark"
-
-    build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
-    build_target_dir.mkdir(parents=True, exist_ok=True)
-
-    if distributed_bin.exists():
-        dist_dst = build_target_dir / "jaide-distributed-futhark"
-        shutil.copy2(str(distributed_bin), str(dist_dst))
-        os.chmod(str(dist_dst), 0o755)
-        _write_fingerprint(dist_dst, source_fp)
-        result["distributed_binary_present"] = True
-    else:
-        result["distributed_binary_present"] = False
-        _log(f"FIGYELMEZTETÉS: a disztributált bináris nem épült fel itt: {distributed_bin}")
-
-    if inference_bin.exists():
-        inf_dst = build_target_dir / "jaide-inference-server"
-        shutil.copy2(str(inference_bin), str(inf_dst))
-        os.chmod(str(inf_dst), 0o755)
-        _write_fingerprint(inf_dst, source_fp)
-        result["inference_binary_present"] = True
-    else:
-        result["inference_binary_present"] = False
-        _log(f"FIGYELMEZTETÉS: az inferencia bináris nem épült fel itt: {inference_bin}")
+    if reuse_blocker is not None:
+        _log(f"A meglévő token dataset újragenerálása szükséges: {reuse_blocker}")
 
     _log("=" * 70)
-    _log(f"C-előkészítő fázis: {SAMPLE_CAP} minta előtokenizálása GPU tréninghez")
+    _log(f"C-előkészítő fázis: legfeljebb {SAMPLE_CAP} minta előtokenizálása")
     _log("=" * 70)
+
     token_dataset_path.parent.mkdir(parents=True, exist_ok=True)
     pretokenize_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-pretokenize"
     if not pretokenize_bin.is_file():
+        _log("Az előtokenizáló bináris hiányzik, fordítása: zig build pretokenize")
         _run(
             ["zig", "build", "pretokenize", "-Doptimize=ReleaseSafe", "-Dskip-futhark=true"],
             cwd=project_dir,
@@ -1253,32 +1490,69 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
         )
     if not pretokenize_bin.is_file():
         raise RuntimeError(f"Az előtokenizáló bináris hiányzik: {pretokenize_bin}")
-    _safe_unlink(token_dataset_path)
-    _safe_unlink(token_dataset_path.with_name(token_dataset_path.name + ".tmp"))
-    pretokenize_tmp = token_dataset_path.with_name(token_dataset_path.name + ".tmp")
-    vocab_path = Path(CHECKPOINT_PATH)
-    if not vocab_path.is_file() or vocab_path.stat().st_size <= 0:
-        raise RuntimeError(f"A Modal checkpoint tokenizer hiányzik vagy üres: {vocab_path}")
+
+    count_started = time.time()
+    available_samples = _count_nonempty_lines(dataset_path)
+    _log(
+        f"A korpusz {available_samples} nem üres mintát tartalmaz "
+        f"({time.time() - count_started:.1f}s alatt beolvasva)"
+    )
+    if available_samples <= 0:
+        raise RuntimeError(f"A korpusz nem tartalmaz feldolgozható mintát: {dataset_path}")
+
+    effective_cap = min(SAMPLE_CAP, available_samples)
+    if effective_cap < SAMPLE_CAP:
+        _log(
+            f"FIGYELMEZTETÉS: a kért {SAMPLE_CAP} minta helyett csak "
+            f"{effective_cap} áll rendelkezésre"
+        )
+
+    output_tmp = token_dataset_path.with_name(token_dataset_path.name + ".tmp")
+    _safe_unlink(output_tmp)
+
     sample_count, size, prep_duration = _parallel_pretokenize(
         pretokenize_bin=pretokenize_bin,
         input_path=dataset_path,
-        output_tmp=pretokenize_tmp,
-        vocab_path=vocab_path,
+        output_tmp=output_tmp,
+        vocab_path=Path(CHECKPOINT_PATH),
         max_seq_len=MAX_SEQ_LEN,
-        sample_cap=SAMPLE_CAP,
+        sample_cap=effective_cap,
         project_dir=project_dir,
         env=env,
-        timeout=CPU_TIMEOUT_SEC,
+        timeout=PRETOKENIZE_TIMEOUT_SEC,
+        stall_timeout=PRETOKENIZE_STALL_TIMEOUT_SEC,
     )
-    pretokenize_tmp.replace(token_dataset_path)
+
+    merged_meta = _read_token_dataset_meta(output_tmp)
+    if merged_meta is None:
+        _safe_unlink(output_tmp)
+        raise RuntimeError(f"Az előtokenizált dataset fejléce érvénytelen: {output_tmp}")
+    if merged_meta["total_tokens"] != sample_count * (MAX_SEQ_LEN + 1):
+        _safe_unlink(output_tmp)
+        raise RuntimeError(
+            f"Az előtokenizált dataset token-száma hibás: {merged_meta['total_tokens']} != "
+            f"{sample_count * (MAX_SEQ_LEN + 1)}"
+        )
+    if merged_meta["vocabulary_size"] != tokenizer_checkpoint["token_count"]:
+        _safe_unlink(output_tmp)
+        raise RuntimeError(
+            f"Az előtokenizált dataset szótármérete hibás: {merged_meta['vocabulary_size']} != "
+            f"{tokenizer_checkpoint['token_count']}"
+        )
+
+    os.replace(output_tmp, token_dataset_path)
+
     result["phases"]["C_prep_dataset"] = {
         "duration_s": round(prep_duration, 2),
         "sample_count": sample_count,
+        "available_sample_count": available_samples,
         "dataset_bytes": size,
         "dataset_path": str(token_dataset_path),
         "source_dataset_path": str(dataset_path),
         "source": "modal_volume:jaide-bench-data",
         "pretokenized": True,
+        "vocabulary_size": merged_meta["vocabulary_size"],
+        "maximum_sequence_length": merged_meta["maximum_sequence_length"],
     }
     _log(f"Modal volume dataset készen áll: {sample_count} minta, {size} bájt")
 
@@ -1938,6 +2212,16 @@ def main() -> None:
         raise ValueError("A JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS nem lehet negatív")
     if INFERENCE_STARTUP_TIMEOUT_SEC <= 0:
         raise ValueError("A JAIDE_INFERENCE_STARTUP_TIMEOUT értékének pozitívnak kell lennie")
+    if PRETOKENIZE_TIMEOUT_SEC <= 0:
+        raise ValueError("A JAIDE_BENCH_PRETOKENIZE_TIMEOUT értékének pozitívnak kell lennie")
+    if PRETOKENIZE_STALL_TIMEOUT_SEC <= 0:
+        raise ValueError("A JAIDE_BENCH_PRETOKENIZE_STALL értékének pozitívnak kell lennie")
+    if PRETOKENIZE_STALL_TIMEOUT_SEC >= PRETOKENIZE_TIMEOUT_SEC:
+        raise ValueError("A JAIDE_BENCH_PRETOKENIZE_STALL értékének kisebbnek kell lennie a teljes időkorlátnál")
+    if VOCAB_TRAIN_TIMEOUT_SEC <= 0:
+        raise ValueError("A JAIDE_BENCH_VOCAB_TIMEOUT értékének pozitívnak kell lennie")
+    if VOCAB_CORPUS_BYTES <= 0:
+        raise ValueError("A JAIDE_BENCH_VOCAB_CORPUS_BYTES értékének pozitívnak kell lennie")
     try:
         reconstruction_alpha_value = float(RECONSTRUCTION_ALPHA)
     except ValueError as exc:
