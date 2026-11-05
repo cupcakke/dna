@@ -1,17 +1,3 @@
-//! Offline pre-tokenizer for the JAIDE distributed trainer.
-//!
-//! The tool turns a JSONL corpus into the memory-mapped token dataset that the
-//! Futhark trainer reads: a 64-byte little-endian header followed by fixed-size
-//! windows of `max_sequence_length + 1` `u32` token ids.
-//!
-//! Operational contract:
-//!   * encoding is bounded, so a single record can never encode more than one
-//!     window and a pathological record cannot stall the process;
-//!   * progress is reported on stderr every few seconds, which makes a slow
-//!     shard visible instead of looking like a hang;
-//!   * the output is written to `<output>.tmp` and atomically renamed, so a
-//!     failed run never destroys a previously valid dataset.
-
 const std = @import("std");
 const MGT = @import("../tokenizer/mgt.zig").MGT;
 const dataset = @import("../distributed/mmap_token_dataset.zig");
@@ -53,28 +39,25 @@ fn printUsage(writer: anytype) !void {
     );
 }
 
-fn parseOptions(allocator: std.mem.Allocator) !Options {
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+fn parseOptions(allocator: std.mem.Allocator, arguments: []const [:0]u8) !Options {
+    if (arguments.len < 5 or arguments.len > 6) return CliError.InvalidArguments;
 
-    _ = args.next();
-    const input_path = args.next() orelse return CliError.InvalidArguments;
-    const output_path = args.next() orelse return CliError.InvalidArguments;
-    const vocabulary_path = args.next() orelse return CliError.InvalidArguments;
-    const max_sequence_raw = args.next() orelse return CliError.InvalidArguments;
+    const input_path: []const u8 = arguments[1];
+    const output_path: []const u8 = arguments[2];
+    const vocabulary_path: []const u8 = arguments[3];
+    const max_sequence_raw: []const u8 = arguments[4];
 
     const max_sequence_length = std.fmt.parseInt(usize, max_sequence_raw, 10) catch return CliError.InvalidArguments;
     if (max_sequence_length == 0) return CliError.InvalidArguments;
 
-    const sample_count = if (args.next()) |raw| blk: {
+    const sample_count: ?usize = if (arguments.len == 6) blk: {
+        const raw: []const u8 = arguments[5];
         const value = std.fmt.parseInt(usize, raw, 10) catch return CliError.InvalidArguments;
         if (value == 0) return CliError.InvalidArguments;
-        break :blk @as(?usize, value);
+        break :blk value;
     } else null;
 
-    if (args.next() != null) return CliError.InvalidArguments;
-
-    const progress_interval_seconds = blk: {
+    const progress_interval_seconds: u64 = blk: {
         const raw = std.process.getEnvVarOwned(allocator, "JAIDE_PRETOKENIZE_PROGRESS_SECONDS") catch |err| switch (err) {
             error.EnvironmentVariableNotFound => break :blk default_progress_interval_seconds,
             else => return err,
@@ -93,13 +76,6 @@ fn parseOptions(allocator: std.mem.Allocator) !Options {
     };
 }
 
-/// Rejects output paths that alias the corpus or the vocabulary; truncating one
-/// of the inputs would silently corrupt the run.
-///
-/// Both the destination and its temporary sibling are checked, because the run
-/// writes into `<output>.tmp` first. A candidate that does not exist cannot alias
-/// anything, so it is skipped. The caller's allocator is used so that every
-/// allocation of the process has a single owner.
 fn ensureOutputIsDistinct(allocator: std.mem.Allocator, options: Options) !void {
     const input_file = try text_tools.openRead(options.input_path);
     defer input_file.close();
@@ -112,8 +88,7 @@ fn ensureOutputIsDistinct(allocator: std.mem.Allocator, options: Options) !void 
     const candidates = [_][]const u8{ options.output_path, temporary_path };
 
     for (candidates) |candidate| {
-        const existing = text_tools.openRead(candidate) catch continue;
-        var existing_file = existing;
+        const existing_file = text_tools.openRead(candidate) catch continue;
         defer existing_file.close();
         if (try text_tools.sameFile(&input_file, &existing_file)) return CliError.InvalidArguments;
         if (try text_tools.sameFile(&vocabulary_file, &existing_file)) return CliError.InvalidArguments;
@@ -135,7 +110,10 @@ pub fn main() !void {
     }
     const allocator = gpa.allocator();
 
-    const options = parseOptions(allocator) catch |err| switch (err) {
+    const arguments = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, arguments);
+
+    const options = parseOptions(allocator, arguments) catch |err| switch (err) {
         CliError.InvalidArguments => {
             try printUsage(std.io.getStdErr().writer());
             return CliError.InvalidArguments;
@@ -151,10 +129,10 @@ pub fn main() !void {
     try tokenizer.loadVocab(options.vocabulary_path);
 
     if (tokenizer.next_token_id <= pad_token_id) return CliError.TokenOutOfRange;
-    const vocabulary_size = tokenizer.next_token_id;
+    const vocabulary_size: u32 = std.math.cast(u32, tokenizer.next_token_id) orelse return CliError.VocabularyTooLarge;
 
-    const estimated_windows = options.sample_count orelse 0;
-    const estimated_tokens = std.math.mul(u64, window_tokens_u64, @as(u64, estimated_windows)) catch 0;
+    const estimated_windows: usize = options.sample_count orelse 0;
+    const estimated_tokens: u64 = std.math.mul(u64, window_tokens_u64, @as(u64, estimated_windows)) catch 0;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -183,7 +161,7 @@ pub fn main() !void {
     defer allocator.free(temporary_path);
     text_tools.deleteFile(temporary_path);
 
-    var output_file = try text_tools.openWrite(temporary_path);
+    const output_file = try text_tools.openWrite(temporary_path);
     var output_is_closed = false;
     var temporary_is_present = true;
     defer {
@@ -193,21 +171,19 @@ pub fn main() !void {
 
     try output_file.setEndPos(0);
 
-    var writer = output_file.writer();
-    try writer.writeAll(dataset.magic);
+    const writer = output_file.writer();
+    try writer.writeAll(dataset.magic[0..]);
     try writer.writeInt(u32, dataset.version, .little);
     try writer.writeInt(u32, dataset.token_type_u32, .little);
     try writer.writeInt(u64, dataset.header_size, .little);
     const count_position = try output_file.getPos();
     try writer.writeInt(u64, 0, .little);
-    try writer.writeInt(u64, vocabulary_size, .little);
-    // The header records the context length. Every stored window carries one
-    // additional token as the prediction target, so the payload length is
-    // `(maximum_sequence_length + 1)` tokens per sample.
-    try writer.writeInt(u64, @intCast(options.max_sequence_length), .little);
+    try writer.writeInt(u64, @as(u64, vocabulary_size), .little);
+    try writer.writeInt(u64, @as(u64, @intCast(options.max_sequence_length)), .little);
     try writer.writeInt(u64, 0, .little);
     try writer.writeInt(u64, 0, .little);
-    if (try output_file.getPos() != dataset.header_size) return CliError.InvalidInput;
+    const header_end_position = try output_file.getPos();
+    if (header_end_position != dataset.header_size) return CliError.InvalidInput;
 
     var buffered_writer = std.io.bufferedWriter(writer);
     const buffered = buffered_writer.writer();
@@ -227,8 +203,8 @@ pub fn main() !void {
     var bytes_read: u64 = 0;
     var truncated_records: u64 = 0;
 
-    var last_report_ns = std.time.nanoTimestamp();
-    const started_ns = last_report_ns;
+    var last_report_ns: i128 = std.time.nanoTimestamp();
+    const started_ns: i128 = last_report_ns;
     const report_interval_ns: i128 = @as(i128, options.progress_interval_seconds) * std.time.ns_per_s;
     const progress_enabled = options.progress_interval_seconds > 0;
 
@@ -239,17 +215,19 @@ pub fn main() !void {
 
         const has_record = try text_tools.readNextRecord(&line_reader, &record);
         if (!has_record) {
-            if (options.sample_count != null) {
+            if (options.sample_count) |required| {
                 try stderr.print(
                     "jaide-pretokenize: corpus exhausted after {d} records, {d} required\n",
-                    .{ samples_written, options.sample_count.? },
+                    .{ samples_written, required },
                 );
                 return CliError.InvalidInput;
             }
             break;
         }
 
-        bytes_read = std.math.add(u64, bytes_read, @intCast(record.items.len + 1)) catch return CliError.InputTooLarge;
+        const record_length_u64 = std.math.cast(u64, record.items.len) orelse return CliError.InputTooLarge;
+        const record_bytes = std.math.add(u64, record_length_u64, 1) catch return CliError.InputTooLarge;
+        bytes_read = std.math.add(u64, bytes_read, record_bytes) catch return CliError.InputTooLarge;
 
         _ = arena.reset(.retain_capacity);
         const text = try text_tools.extractText(arena.allocator(), record.items);
@@ -261,11 +239,12 @@ pub fn main() !void {
             tokens.shrinkRetainingCapacity(window_length);
         }
         if (tokens.items.len == window_length) truncated_records += 1;
-        encoded_tokens = std.math.add(u64, encoded_tokens, @intCast(tokens.items.len)) catch return CliError.InputTooLarge;
+        const encoded_length_u64 = std.math.cast(u64, tokens.items.len) orelse return CliError.InputTooLarge;
+        encoded_tokens = std.math.add(u64, encoded_tokens, encoded_length_u64) catch return CliError.InputTooLarge;
 
         var index: usize = 0;
         while (index < window_length) : (index += 1) {
-            const token = if (index < tokens.items.len) tokens.items[index] else pad_token_id;
+            const token: u32 = if (index < tokens.items.len) tokens.items[index] else pad_token_id;
             try writeToken(buffered, token, vocabulary_size);
         }
 
@@ -273,11 +252,11 @@ pub fn main() !void {
         samples_written += 1;
 
         if (progress_enabled) {
-            const now = std.time.nanoTimestamp();
+            const now: i128 = std.time.nanoTimestamp();
             if (now - last_report_ns >= report_interval_ns) {
-                const elapsed_ns = now - started_ns;
+                const elapsed_ns: i128 = now - started_ns;
                 const elapsed_seconds = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, std.time.ns_per_s);
-                const sample_rate = if (elapsed_seconds > 0.0)
+                const sample_rate: f64 = if (elapsed_seconds > 0.0)
                     @as(f64, @floatFromInt(samples_written)) / elapsed_seconds
                 else
                     0.0;
@@ -302,7 +281,7 @@ pub fn main() !void {
     try buffered_writer.flush();
     try output_file.sync();
     try output_file.seekTo(count_position);
-    var header_writer = output_file.writer();
+    const header_writer = output_file.writer();
     try header_writer.writeInt(u64, total_tokens, .little);
     try output_file.sync();
     output_file.close();
@@ -313,16 +292,17 @@ pub fn main() !void {
     try text_tools.renameFile(temporary_path, options.output_path);
     temporary_is_present = false;
 
-    const elapsed_ns = std.time.nanoTimestamp() - started_ns;
-    const elapsed_seconds = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, std.time.ns_per_s);
-    const output_size = std.math.add(u64, dataset.header_size, std.math.mul(u64, total_tokens, 4) catch return CliError.InputTooLarge) catch return CliError.InputTooLarge;
-    const tokens_per_second = if (elapsed_seconds > 0.0)
-        @as(f64, @floatFromInt(total_tokens)) / elapsed_seconds
+    const finished_elapsed_ns: i128 = std.time.nanoTimestamp() - started_ns;
+    const finished_elapsed_seconds = @as(f64, @floatFromInt(finished_elapsed_ns)) / @as(f64, std.time.ns_per_s);
+    const payload_bytes = std.math.mul(u64, total_tokens, 4) catch return CliError.InputTooLarge;
+    const output_size = std.math.add(u64, @as(u64, dataset.header_size), payload_bytes) catch return CliError.InputTooLarge;
+    const tokens_per_second: f64 = if (finished_elapsed_seconds > 0.0)
+        @as(f64, @floatFromInt(total_tokens)) / finished_elapsed_seconds
     else
         0.0;
 
     try stderr.print(
         "jaide-pretokenize: finished samples={d} tokens={d} encoded={d} truncated={d} bytes={d} rate={d:.1} tokens/s elapsed={d:.1}s\n",
-        .{ samples_written, total_tokens, encoded_tokens, truncated_records, output_size, tokens_per_second, elapsed_seconds },
+        .{ samples_written, total_tokens, encoded_tokens, truncated_records, output_size, tokens_per_second, finished_elapsed_seconds },
     );
 }
