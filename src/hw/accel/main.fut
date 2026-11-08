@@ -725,7 +725,7 @@ entry rsf_stack_midpoint_fused [batch_size][seq_len][half][num_layers]
   let logdet_forward_mean = sanitize_f32 ((reduce (+) 0f32 ld_fwd) / count_tokens_f32)
   let logdet_backward_mean = sanitize_f32 ((reduce (+) 0f32 ld_bwd) / count_tokens_f32)
   let gs_zero = replicate half (replicate 2 0f32)
-  let (gs_fwd, gt_fwd, x_final, g_final) =
+  let (gs_fwd, gt_fwd, _, g_final) =
     loop (gs_acc, gt_acc, y_all, g_all) =
       (replicate num_layers (copy gs_zero),
        replicate num_layers (copy gs_zero),
@@ -753,7 +753,7 @@ entry rsf_stack_midpoint_fused [batch_size][seq_len][half][num_layers]
           gt_acc with [l] = gt_l_total,
           y_next_all,
           g_next_all)
-  let (gs_bwd, gt_bwd) =
+  let (gs_bwd, gt_bwd, _, _) =
     loop (gs_acc, gt_acc, y_all, g_all) =
       (replicate num_layers (copy gs_zero),
        replicate num_layers (copy gs_zero),
