@@ -1287,10 +1287,6 @@ pub fn main() !void {
     else
         false;
 
-    // When the vocabulary is not precomputed the root rank builds it from the
-    // corpus and every rank then loads it. Returning an error here would make
-    // the branch below unreachable and turn a missing vocabulary into a hard
-    // startup failure with no way to recover inside the same run.
     if (!vocab_ready) {
         std.debug.print(
             "[Rank {d}] No precomputed vocabulary at {s}; the root rank builds it from the corpus\n",
@@ -1298,6 +1294,14 @@ pub fn main() !void {
         );
     }
 
+    const tokenizer_source_owned = std.process.getEnvVarOwned(allocator, "JAIDE_TOKENIZER_SOURCE_PATH") catch null;
+    defer if (tokenizer_source_owned) |value| allocator.free(value);
+    const tokenizer_fallback = if (std.mem.endsWith(u8, dataset_path, ".bin"))
+        try std.fmt.allocPrint(allocator, "{s}.jsonl", .{dataset_path[0 .. dataset_path.len - 4]})
+    else
+        try allocator.dupe(u8, dataset_path);
+    defer allocator.free(tokenizer_fallback);
+    const tokenizer_source_path = tokenizer_source_owned orelse tokenizer_fallback;
     const tokenizer_started = std.time.nanoTimestamp();
     if (!vocab_ready) {
         var vocabulary_error: ?anyerror = null;
@@ -1306,7 +1310,7 @@ pub fn main() !void {
             vocabulary_training: {
                 const vocabulary_samples = loadTokenizerDataset(
                     allocator,
-                    dataset_path,
+                    if (std.mem.endsWith(u8, dataset_path, ".bin")) tokenizer_source_path else dataset_path,
                     10 * 1024 * 1024,
                 ) catch |err| {
                     vocabulary_error = err;
@@ -1339,11 +1343,6 @@ pub fn main() !void {
                     break :vocabulary_training;
                 };
 
-                // The token dataset header records the vocabulary size, and
-                // the loader verifies it against the vocabulary file. Saving a
-                // vocabulary that stopped short of JAIDE_VOCAB_SIZE would make
-                // every later dataset open fail, so the mismatch is reported
-                // here where the cause is still visible.
                 if (temporary_tokenizer.next_token_id != vocab_size) {
                     std.debug.print(
                         "[Rank 0] Vocabulary training reached {d} tokens but JAIDE_VOCAB_SIZE={d}; the corpus does not contain enough mergeable pairs\n",

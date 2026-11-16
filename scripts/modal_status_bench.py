@@ -44,7 +44,6 @@ IGNORE_PATTERNS = [
 
 GPU_SPEC = os.environ.get("JAIDE_BENCH_GPU", "B200:1")
 
-
 def _gpu_count_from_spec(spec: str) -> int:
     parts = spec.rsplit(":", 1)
     if len(parts) == 1:
@@ -64,13 +63,7 @@ PRETOKENIZE_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_TIMEOUT", 
 PRETOKENIZE_STALL_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_PRETOKENIZE_STALL", "300"))
 VOCAB_TRAIN_TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_VOCAB_TIMEOUT", "1800"))
 VOCAB_CORPUS_BYTES = int(os.environ.get("JAIDE_BENCH_VOCAB_CORPUS_BYTES", "10485760"))
-# Root mining criterion of the morphological layer: "paradigm" only accepts a
-# stem that the corpus shows in more than one shape, "frequency" accepts every
-# stem that reaches JAIDE_VOCAB_MIN_ROOT_FREQUENCY, and "auto" (the default)
-# applies the strict rule and falls back to the lenient one only when the corpus
-# proves no paradigm at all. A corpus of repeated fixed phrases therefore still
-# gets a working morphological layer, while natural text never sees a stem that
-# was mined from a single truncation.
+
 VOCAB_ROOT_EVIDENCE = os.environ.get("JAIDE_BENCH_VOCAB_ROOT_EVIDENCE", "auto")
 if VOCAB_ROOT_EVIDENCE not in ("auto", "paradigm", "frequency"):
     raise ValueError(
@@ -119,7 +112,7 @@ GRADIENT_CLIP_NORM = os.environ.get("JAIDE_BENCH_GRADIENT_CLIP_NORM", "1.0")
 SFD_TRUST_RATIO = os.environ.get("JAIDE_BENCH_SFD_TRUST_RATIO", "0.1")
 SFD_WEIGHT_FLOOR = os.environ.get("JAIDE_BENCH_SFD_WEIGHT_FLOOR", "0.001")
 SPECTRAL_INTERVAL = int(os.environ.get("JAIDE_BENCH_SPECTRAL_INTERVAL", "100"))
-LOGDET_WEIGHT = os.environ.get("JAIDE_BENCH_LOGDET_WEIGHT", "-0.001")
+LOGDET_WEIGHT = os.environ.get("JAIDE_BENCH_LOGDET_WEIGHT", "0.001")
 CLIP_MIN = os.environ.get("JAIDE_BENCH_CLIP_MIN", "-5.0")
 CLIP_MAX = os.environ.get("JAIDE_BENCH_CLIP_MAX", "5.0")
 CHECKPOINT_VERSION = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_VERSION", "7"))
@@ -214,10 +207,8 @@ image = (
     )
 )
 
-
 def _log(msg: str) -> None:
     print(f"[bench] {msg}", flush=True)
-
 
 def _safe_unlink(path: Path) -> None:
     try:
@@ -225,7 +216,6 @@ def _safe_unlink(path: Path) -> None:
             path.unlink()
     except FileNotFoundError:
         return
-
 
 def _source_fingerprint(root: Path = LOCAL_PROJECT_DIR) -> str:
     digest = hashlib.sha256()
@@ -242,15 +232,12 @@ def _source_fingerprint(root: Path = LOCAL_PROJECT_DIR) -> str:
         digest.update(b"\n")
     return digest.hexdigest()
 
-
 def _fingerprint_sidecar(path: Path) -> Path:
     return path.with_name(path.name + ".fingerprint")
-
 
 def _write_fingerprint(path: Path, fingerprint: str) -> None:
     sidecar = _fingerprint_sidecar(path)
     sidecar.write_text(fingerprint + "\n", encoding="utf-8")
-
 
 def _fingerprint_matches(path: Path, fingerprint: str) -> bool:
     sidecar = _fingerprint_sidecar(path)
@@ -261,7 +248,6 @@ def _fingerprint_matches(path: Path, fingerprint: str) -> bool:
     except OSError:
         return False
     return stored == fingerprint
-
 
 def _find_latest_binary(name: str, fingerprint: Optional[str] = None) -> Optional[Path]:
     if not BUILD_MOUNT_PATH.exists():
@@ -279,7 +265,6 @@ def _find_latest_binary(name: str, fingerprint: Optional[str] = None) -> Optiona
         return None
     candidates.sort(key=lambda p: (p.stat().st_mtime_ns, str(p)), reverse=True)
     return candidates[0]
-
 
 def _classify_training_failure(output: str, timed_out: bool, init_seen: bool) -> str:
     lowered = output.lower()
@@ -299,7 +284,6 @@ def _classify_training_failure(output: str, timed_out: bool, init_seen: bool) ->
         return "idle_stall"
     return "unknown"
 
-
 def _clear_rank_coordination_files(nccl_id_path: str) -> None:
     base = Path(nccl_id_path)
     _safe_unlink(base)
@@ -310,7 +294,6 @@ def _clear_rank_coordination_files(nccl_id_path: str) -> None:
                 _safe_unlink(marker)
     except FileNotFoundError:
         pass
-
 
 def _terminate_process_group(proc: subprocess.Popen[Any]) -> None:
     if proc.poll() is not None:
@@ -332,7 +315,6 @@ def _terminate_process_group(proc: subprocess.Popen[Any]) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         return
-
 
 def _run(
     cmd: List[str],
@@ -417,7 +399,6 @@ def _run(
         raise SystemExit(f"A parancs hibával fejeződött be (kód={proc.returncode}): {' '.join(cmd)}")
     return int(proc.returncode or 0), out, dt
 
-
 def _run_multirank(
     cmd: List[str],
     cwd: str,
@@ -427,7 +408,7 @@ def _run_multirank(
     timeout: int,
     init_deadline_sec: Optional[int] = None,
     idle_watchdog_sec: Optional[int] = None,
-    init_marker: str = "[Step ",
+    init_marker: str = "[Rank 0] Step ",
 ) -> Tuple[int, str, float]:
     if num_gpus <= 0:
         raise ValueError("A GPU-k számának legalább 1-nek kell lennie")
@@ -561,14 +542,12 @@ def _run_multirank(
         )
     return combined_rc, combined_out, dt
 
-
 def _write_report(report_dir: Path, name: str, content: str) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
     fp = report_dir / name
     with open(fp, "w", encoding="utf-8") as f:
         f.write(content)
     _log(f"Jelentés elmentve: {fp}")
-
 
 def _count_nonempty_lines(path: Path) -> int:
     count = 0
@@ -577,7 +556,6 @@ def _count_nonempty_lines(path: Path) -> int:
             if line.strip():
                 count += 1
     return count
-
 
 def _read_token_dataset_meta(path: Path) -> Optional[Dict[str, int]]:
     try:
@@ -605,14 +583,8 @@ def _read_token_dataset_meta(path: Path) -> Optional[Dict[str, int]]:
     except (OSError, struct.error, ValueError):
         return None
 
-
 def _tail_new_log_bytes(log_path: Path, offset: int, prefix: str) -> Tuple[int, bool]:
-    """Kiírja a worker naplójának offset óta keletkezett új sorait.
 
-    A visszatérési érték az új olvasási pozíció, valamint hogy történt-e
-    előrelépés. Az előrelépés-figyelés ezen alapul: ha egy worker hosszú ideig
-    nem ír semmit, akkor a folyamat megakadt, és nem szabad tovább várni rá.
-    """
     try:
         size = log_path.stat().st_size
     except OSError:
@@ -629,14 +601,13 @@ def _tail_new_log_bytes(log_path: Path, offset: int, prefix: str) -> Tuple[int, 
             print(f"{prefix} {line}", flush=True)
     return new_offset, progressed
 
-
 def _merge_pretokenized_parts(
     part_outputs: List[Path],
     part_counts: List[int],
     output_tmp: Path,
     max_seq_len: int,
 ) -> Tuple[int, int]:
-    """A worker kimenetek fejléceit ellenőrzi és egyetlen adathalmazzá fűzi."""
+
     part_meta: List[Dict[str, int]] = []
     total_tokens = 0
     vocabulary_size = 0
@@ -694,14 +665,13 @@ def _merge_pretokenized_parts(
 
     return total_tokens, vocabulary_size
 
-
 def _split_pretokenize_input(
     input_path: Path,
     part_inputs: List[Path],
     samples_per_worker: int,
     sample_cap: int,
 ) -> List[int]:
-    """A korpusz első `sample_cap` nem üres rekordját worker részekre osztja."""
+
     part_counts = [0] * len(part_inputs)
     handles = [path.open("wb") for path in part_inputs]
     written = 0
@@ -728,7 +698,6 @@ def _split_pretokenize_input(
         )
     return part_counts
 
-
 def _worker_logs(work_dir: Path, worker_count: int) -> str:
     chunks: List[str] = []
     for index in range(worker_count):
@@ -738,7 +707,6 @@ def _worker_logs(work_dir: Path, worker_count: int) -> str:
             if content.strip():
                 chunks.append(f"--- worker-{index:03d} ---\n{content}")
     return "\n".join(chunks) if chunks else "(a workerek nem írtak naplót)"
-
 
 def _parallel_pretokenize(
     pretokenize_bin: Path,
@@ -752,14 +720,7 @@ def _parallel_pretokenize(
     timeout: int,
     stall_timeout: int,
 ) -> Tuple[int, int, float]:
-    """A korpuszt párhuzamos worker folyamatokkal tokenizálja.
 
-    A függvény folyamatosan figyeli a worker naplókat: minden új sort kiír a
-    Modal naplóba (így a futás soha nem tűnik némán megakadtnak), és ha egy
-    worker a megadott időn belül egyáltalán nem termel kimenetet, akkor leállítja
-    az összes workert és hibát dob a naplók mellékelésével, ahelyett hogy a
-    GPU/CPU foglalás órákig ücsörögne egy megakadt folyamatra várva.
-    """
     if sample_cap <= 0:
         raise ValueError("A minta-korlátnak pozitívnak kell lennie")
     if timeout <= 0:
@@ -912,7 +873,6 @@ def _parallel_pretokenize(
                 pass
         shutil.rmtree(work_dir, ignore_errors=True)
 
-
 def _is_current_vocab_format(path: Path) -> bool:
     try:
         with path.open("rb") as source:
@@ -948,7 +908,6 @@ def _is_current_vocab_format(path: Path) -> bool:
             return True
     except (OSError, ValueError):
         return False
-
 
 def _reformat_legacy_vocab(path: Path) -> bool:
     data = path.read_bytes()
@@ -1021,9 +980,8 @@ def _reformat_legacy_vocab(path: Path) -> bool:
         raise
     return True
 
-
 def _vocabulary_token_count(path: Path) -> Optional[int]:
-    """Visszaadja a szótár tokenjeinek számát, ha a fájl a jelenlegi formátumú."""
+
     if not path.is_file() or path.stat().st_size <= 0:
         return None
     if not _is_current_vocab_format(path):
@@ -1040,9 +998,8 @@ def _vocabulary_token_count(path: Path) -> Optional[int]:
         return None
     return token_count
 
-
 def _ensure_vocab_binary(project_dir: str, env: Dict[str, str]) -> Path:
-    """A `jaide-vocab-train` binárist előállítja, ha még nincs a zig-out alatt."""
+
     binary = Path(project_dir) / "zig-out" / "bin" / "jaide-vocab-train"
     if binary.is_file():
         return binary
@@ -1057,18 +1014,12 @@ def _ensure_vocab_binary(project_dir: str, env: Dict[str, str]) -> Path:
         raise RuntimeError(f"A szótárépítő bináris hiányzik: {binary}")
     return binary
 
-
 def _prepare_vocabulary(
     dataset_path: Path,
     project_dir: str,
     env: Dict[str, str],
 ) -> Dict[str, Any]:
-    """Gondoskodik arról, hogy a checkpoint kötetben érvényes szótár legyen.
 
-    A szótárat CPU-n, a korpusz egy korlátozott szeletéből építjük fel, így a
-    GPU fázis soha nem tölt időt szótárépítéssel, és a teljes előkészítés
-    reprodukálható: ugyanaz a korpusz-szelet mindig ugyanazt a szótárat adja.
-    """
     checkpoint_path = Path(CHECKPOINT_PATH)
 
     existing = _vocabulary_token_count(checkpoint_path)
@@ -1198,22 +1149,11 @@ def _prepare_vocabulary(
         )
     return result
 
-
 def _anchor_list_path(vocabulary_path: Path) -> Path:
     return vocabulary_path.with_name(vocabulary_path.name + ".anchors")
 
-
 def _stage_anchor_list(temporary_destination: Path, checkpoint_path: Path) -> Optional[Dict[str, Any]]:
-    """Moves the anchor list written by the vocabulary trainer next to the
-    final vocabulary.
 
-    The trainer writes the mined morphological roots beside its output file as a
-    newline-separated token list, which is the format the trainer reads through
-    JAIDE_TOKENIZER_ANCHORS. Staging it under the vocabulary's final name keeps
-    the checkpoints volume consistent after the atomic rename of the vocabulary
-    itself, and a missing or empty list is reported as nothing rather than as a
-    failure, because legacy vocabularies simply do not carry one.
-    """
     temporary_anchors = _anchor_list_path(temporary_destination)
     if not temporary_anchors.is_file():
         return None
@@ -1234,18 +1174,8 @@ def _stage_anchor_list(temporary_destination: Path, checkpoint_path: Path) -> Op
         "token_count": data.count(b"\n"),
     }
 
-
 def _export_anchor_list(train_env: Dict[str, str]) -> Optional[Path]:
-    """Adds the staged anchor list of the vocabulary to the training environment.
 
-    The vocabulary file carries the mined morphological roots itself, so every
-    rank that loads the binary vocabulary already has them. The token list exists
-    for the paths that rebuild a tokenizer from a plain word list (the
-    checkpoint-restore stage of the trainer), and those paths read it from
-    JAIDE_TOKENIZER_ANCHORS. Pointing the variable at a file that does not exist
-    would make the trainer fail while rebuilding its tokenizer, so the variable
-    is only set when the staged list is actually present and non-empty.
-    """
     anchors_file = _anchor_list_path(Path(CHECKPOINT_PATH))
     if anchors_file.is_file() and anchors_file.stat().st_size > 0:
         train_env["JAIDE_TOKENIZER_ANCHORS"] = str(anchors_file)
@@ -1256,7 +1186,6 @@ def _export_anchor_list(train_env: Dict[str, str]) -> Optional[Path]:
         return anchors_file
     train_env.pop("JAIDE_TOKENIZER_ANCHORS", None)
     return None
-
 
 def _parse_gpu_monitor(text: str) -> Dict[str, Any]:
     samples: Dict[int, Dict[str, List[float]]] = {}
@@ -1292,7 +1221,6 @@ def _parse_gpu_monitor(text: str) -> Dict[str, Any]:
             if values
         }
     return result
-
 
 @app.function(
     image=image,
@@ -1382,26 +1310,8 @@ def inspect_prepared_state(run_id: int) -> Dict[str, Any]:
         "phases": {"C_prep_dataset": dataset_phase},
     }
 
-
-@app.function(
-    image=image,
-    cpu=(CPU_REQUEST, CPU_LIMIT),
-    memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
-    timeout=CPU_TIMEOUT_SEC,
-    volumes={
-        str(DATA_MOUNT_PATH): data_volume,
-        str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
-        str(REPORT_MOUNT_PATH): report_volume,
-        str(BUILD_MOUNT_PATH): build_volume,
-    },
-)
 def _build_gpu_binaries(project_dir: str, env: Dict[str, str]) -> Tuple[int, str, float]:
-    """Lefordítja a GPU fázis binárisait a CPU dolgozón.
 
-    A Futhark CUDA kódgenerálás és a Zig linkelés a CPU image-ben fut, így a
-    drága GPU foglalás csak a tényleges betanítás idejére él. A szótárat és a
-    token datasettet ez a lépés nem érinti.
-    """
     _log("GPU binárisok fordítása: zig build distributed-futhark inference-server -Dgpu=true")
     return _run(
         [
@@ -1418,12 +1328,10 @@ def _build_gpu_binaries(project_dir: str, env: Dict[str, str]) -> Tuple[int, str
         timeout=BUILD_TIMEOUT_SEC,
     )
 
-
 def _copy_binary(source: Path, destination: Path, fingerprint: str) -> None:
     shutil.copy2(str(source), str(destination))
     os.chmod(str(destination), 0o755)
     _write_fingerprint(destination, fingerprint)
-
 
 def _stage_available_binaries(
     run_id: int,
@@ -1432,13 +1340,7 @@ def _stage_available_binaries(
     result: Dict[str, Any],
     env: Dict[str, str],
 ) -> None:
-    """Gondoskodik a GPU fázis binárisairól a build volume-ban.
 
-    A token dataset újrahasználata és a binárisok megléte két független kérdés:
-    akkor is fel kell deríteni (vagy le kell fordítani) a binárisokat, ha a
-    dataset már készen van, különben a vezérlő folyamat tévesen azt hinné, hogy
-    nincs mit futtatni.
-    """
     build_target_dir = BUILD_MOUNT_PATH / f"run_{run_id}"
     build_target_dir.mkdir(parents=True, exist_ok=True)
     dist_dst = build_target_dir / "jaide-distributed-futhark"
@@ -1496,14 +1398,20 @@ def _stage_available_binaries(
         result["inference_binary_present"] = False
         _log(f"FIGYELMEZTETÉS: az inferencia bináris nem érhető el innen: {project_inference}")
 
-
+@app.function(
+    image=image,
+    cpu=(CPU_REQUEST, CPU_LIMIT),
+    memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
+    timeout=CPU_TIMEOUT_SEC,
+    volumes={
+        str(DATA_MOUNT_PATH): data_volume,
+        str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
+        str(REPORT_MOUNT_PATH): report_volume,
+        str(BUILD_MOUNT_PATH): build_volume,
+    },
+)
 def prepare_cpu(run_id: int) -> Dict[str, Any]:
-    """A CPU fázis: szótár, binárisok és előtokenizált dataset előállítása.
 
-    A függvény minden lépésnél naplóz, minden hosszú műveletnek külön
-    időkorlátja és megakadás-figyelője van, és a meglévő token datasettet csak
-    akkor írja felül, ha az új változat hibátlanul elkészült.
-    """
     build_volume.reload()
     data_volume.reload()
     checkpoint_volume.reload()
@@ -1691,7 +1599,6 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     _log("=" * 70)
 
     return result
-
 
 @app.function(
     image=image,
@@ -1955,7 +1862,7 @@ def run_gpu_train_and_infer(
             monitor_file.close()
         phase_c_duration = time.time() - t0
         training_succeeded = rc_c == 0
-        training_failure_class = _classify_training_failure(out_c, watchdog_error is not None, "[Step " in out_c)
+        training_failure_class = _classify_training_failure(out_c, watchdog_error is not None, "[Rank 0] Step " in out_c)
         gpu_monitor_text = monitor_path.read_text(encoding="utf-8") if monitor_path.exists() else ""
         gpu_monitor_metrics = _parse_gpu_monitor(gpu_monitor_text)
         _write_report(report_dir, "phase_c_gpu_monitor.csv", gpu_monitor_text)
@@ -1995,23 +1902,23 @@ def run_gpu_train_and_infer(
                         throughput_samples.append((token_count, step_time_ms))
                 except (ValueError, IndexError):
                     pass
-            if "[Step " in line and "Loss:" in line:
+            if "[Rank 0] Step " in line and "completed loss=" in line:
                 try:
-                    s_part = line.split("[Step ")[1].split("]")[0].strip()
+                    s_part = line.split("[Rank 0] Step ", 1)[1].split()[0]
                     step_index = int(s_part)
-                    l_part = line.split("Loss:")[1].strip().split()[0]
+                    l_part = line.split("loss=", 1)[1].split()[0]
                     loss_curve.append((step_index, float(l_part)))
                 except (ValueError, IndexError):
                     continue
-                if "Recon:" in line:
+                if "recon=" in line:
                     try:
-                        r_part = line.split("Recon:")[1].strip().split()[0]
+                        r_part = line.split("recon=", 1)[1].split()[0]
                         recon_curve.append((step_index, float(r_part)))
                     except (ValueError, IndexError):
                         pass
-                if "SourceRMS:" in line:
+                if "src_rms=" in line:
                     try:
-                        rms_part = line.split("SourceRMS:")[1].strip().split()[0]
+                        rms_part = line.split("src_rms=", 1)[1].split()[0]
                         source_rms_curve.append((step_index, float(rms_part)))
                     except (ValueError, IndexError):
                         pass
@@ -2309,7 +2216,6 @@ def run_gpu_train_and_infer(
 
     return result
 
-
 @app.local_entrypoint()
 def main() -> None:
     if RUN_MODE not in {"all", "prep", "train", "build"}:
@@ -2391,8 +2297,8 @@ def main() -> None:
         if not math.isfinite(value) or value <= lower or (upper is not None and value > upper):
             raise ValueError(f"A(z) {name} értéke a megengedett tartományon kívül esik")
     logdet_weight_value = float(LOGDET_WEIGHT)
-    if not math.isfinite(logdet_weight_value):
-        raise ValueError("A JAIDE_BENCH_LOGDET_WEIGHT értékének véges számnak kell lennie")
+    if not math.isfinite(logdet_weight_value) or logdet_weight_value < 0.0:
+        raise ValueError("A JAIDE_BENCH_LOGDET_WEIGHT értékének véges, nemnegatív számnak kell lennie")
     learning_rate_value = float(LEARNING_RATE)
     if not math.isfinite(learning_rate_value) or learning_rate_value <= 0.0:
         raise ValueError("A JAIDE_BENCH_LR értékének véges és pozitív számnak kell lennie")

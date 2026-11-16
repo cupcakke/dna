@@ -13,9 +13,6 @@ pub const Node = nsir_core.Node;
 pub const Edge = nsir_core.Edge;
 pub const EdgeQuality = nsir_core.EdgeQuality;
 
-/// The RSF substrate the VPU executes. Re-exported so the VPU is constructed
-/// and driven natively through RSF handles only: every coupling entry point in
-/// this file takes an `*const RSF` / `*RSF` or a tensor bound to one.
 pub const RSF = rsf_mod.RSF;
 pub const RSFLatentState = rsf_mod.RSFLatentState;
 pub const RSFBranch = rsf_mod.RSFBranch;
@@ -418,7 +415,8 @@ pub fn SimdVector(comptime T: type, comptime N: usize) type {
                 return VectorError.InvalidLength;
             }
             var arr: [N]T = undefined;
-            var i: usize = 0; while (i < N) : (i += 1) {
+            var i: usize = 0;
+            while (i < N) : (i += 1) {
                 arr[i] = slice[i];
             }
             return Self{ .data = @as(VecType, arr) };
@@ -426,7 +424,8 @@ pub fn SimdVector(comptime T: type, comptime N: usize) type {
 
         pub fn initFromSlice(slice: []const T) Self {
             var arr: [N]T = undefined;
-            var i: usize = 0; while (i < N) : (i += 1) {
+            var i: usize = 0;
+            while (i < N) : (i += 1) {
                 if (i < slice.len) {
                     arr[i] = slice[i];
                 } else {
@@ -604,7 +603,8 @@ pub fn SimdVector(comptime T: type, comptime N: usize) type {
             result[0] = a[1] * b[2] - a[2] * b[1];
             result[1] = a[2] * b[0] - a[0] * b[2];
             result[2] = a[0] * b[1] - a[1] * b[0];
-            var i: usize = 3; while (i < N) : (i += 1) {
+            var i: usize = 3;
+            while (i < N) : (i += 1) {
                 result[i] = if (T == f32 or T == f64) @as(T, 0.0) else @as(T, 0);
             }
             return Self.initFromArray(result);
@@ -872,7 +872,8 @@ pub const VectorBatch = struct {
         const process_count = @min(self.batch_size, self.vectors.items.len);
         var success_count: usize = 0;
         var skip_count: usize = 0;
-        var i: usize = 0; while (i < process_count) : (i += 1) {
+        var i: usize = 0;
+        while (i < process_count) : (i += 1) {
             const entry = &self.vectors.items[i];
             switch (operation) {
                 .normalize => self.normalizeEntry(entry) catch |err| switch (err) {
@@ -903,10 +904,7 @@ pub const VectorBatch = struct {
                     },
                     else => return err,
                 },
-                // The RSF coupling variants never reach the arithmetic vector
-                // batch: `VPU.processVectors` routes them to the coupling batch
-                // before this point. They are listed explicitly so the switch
-                // stays exhaustive and a future variant cannot be dropped.
+
                 .coupling_forward, .coupling_inverse, .coupling_adjoint, .coupling_diffuse, .coupling_causal_forward => {
                     skip_count += 1;
                     continue;
@@ -1086,14 +1084,6 @@ pub const VectorBatch = struct {
     }
 };
 
-/// A validated, borrowed view of one RSF coupling layer's parameters.
-///
-/// Every field is checked by `validate` before the lanes are driven: the two
-/// parameter tensors must carry `.layer_weight_s` / `.layer_weight_t` bindings
-/// belonging to the *same* model and layer, with matching `dim`. An unbound or
-/// misbound tensor is rejected with the typed `types.RSFBindingError`, never
-/// silently coerced. `mask` selects the causal cross-token coupling mode of
-/// Section 4.8 when non-null; the per-token row coupling is used otherwise.
 pub const CouplingParamsRef = struct {
     model_id: u64,
     layer_index: usize,
@@ -1125,9 +1115,6 @@ pub const CouplingParamsRef = struct {
         if (self.t_weight.data.len < required) return core_types.RSFBindingError.RSFDimMismatch;
     }
 
-    /// Builds the canonical parameter view consumed by the `tensor.zig`
-    /// kernels. `validate` must have succeeded; it is re-run here so a params
-    /// view can never be formed from misbound storage.
     pub fn params(self: Self) core_types.Error!core_tensor.RSFCouplingParams {
         self.validate() catch return core_types.Error.InvalidArgument;
         return core_tensor.RSFCouplingParams.init(
@@ -1144,11 +1131,6 @@ pub const CouplingParamsRef = struct {
     }
 };
 
-/// A batch of RSF coupling rows held as one contiguous `[count, 2*dim]` slab
-/// plus the binding that records which model/layer produced it. This is the
-/// "batches of coupling lanes plus their bindings" storage of Phase 9: the
-/// existing arithmetic `VectorBatch` is left untouched for the quantum/LNS
-/// utilities that consume it.
 pub const CouplingBatch = struct {
     rows: ArrayList(f32),
     count: usize,
@@ -1202,13 +1184,20 @@ pub const CouplingBatch = struct {
         return self.rows.items[index * len ..][0..len];
     }
 
-    /// Applies the canonical coupling forward to every row. Returns the summed
-    /// `Σ_d c[d]` log-det over the batch (f64 accumulation, cast once).
     pub fn forward(self: *Self, params: CouplingParamsRef, scale: []f32, trans: []f32) !f64 {
         try params.validate();
         if (params.dim != self.dim) return core_types.RSFBindingError.RSFDimMismatch;
         const p = try params.params();
         const logdet = try core_tensor.couplingForwardRows(p, self.rows.items, self.count, scale, trans);
+        for (0..self.count) |row_index| {
+            const values = try self.row(row_index);
+            for (0..self.dim) |d| {
+                const x1 = values[d];
+                const x2 = values[self.dim + d];
+                values[d] = (x1 - x2) * 0.7071067811865476;
+                values[self.dim + d] = (x1 + x2) * 0.7071067811865476;
+            }
+        }
         if (params.diffusion) {
             const layout = params.diffusionLayout() orelse return error.ZeroDimension;
             try core_tensor.globalDiffuseRowsStack(self.rows.items, self.count, layout);
@@ -1216,8 +1205,6 @@ pub const CouplingBatch = struct {
         return logdet;
     }
 
-    /// Applies the exact coupling inverse to every row, undoing the diffusion
-    /// factor first (Θ is its own inverse, so the order is the mirror image).
     pub fn inverse(self: *Self, params: CouplingParamsRef, scale: []f32, trans: []f32) !f64 {
         try params.validate();
         if (params.dim != self.dim) return core_types.RSFBindingError.RSFDimMismatch;
@@ -1226,10 +1213,18 @@ pub const CouplingBatch = struct {
             const layout = params.diffusionLayout() orelse return error.ZeroDimension;
             try core_tensor.globalDiffuseRowsStack(self.rows.items, self.count, layout);
         }
+        for (0..self.count) |row_index| {
+            const values = try self.row(row_index);
+            for (0..self.dim) |d| {
+                const y1 = values[d];
+                const y2 = values[self.dim + d];
+                values[d] = (y1 + y2) * 0.7071067811865476;
+                values[self.dim + d] = (y2 - y1) * 0.7071067811865476;
+            }
+        }
         return try core_tensor.couplingInverseRows(p, self.rows.items, self.count, scale, trans);
     }
 
-    /// Applies the unparameterized global diffusion Θ to every row.
     pub fn diffuse(self: *Self) !void {
         if (self.count == 0) return;
         const layout = core_types.rsfDiffusionLayout(self.rowLen()) orelse return error.ZeroDimension;
@@ -1237,10 +1232,6 @@ pub const CouplingBatch = struct {
         try core_tensor.globalDiffuseRowsStack(self.rows.items, self.count, layout);
     }
 
-    /// Causal cross-token coupling over the whole batch (Section 4.8). The
-    /// batch is interpreted as `[sequences, seq_len, dim, 2]` flattened, so
-    /// `count` must be a whole multiple of `mask.seq_len`. Returns the summed
-    /// `Σ_t Σ_d s_{t,d}` log-det over every sequence.
     pub fn causalForward(self: *Self, params: CouplingParamsRef, scratch: *CausalCouplingScratch) !f64 {
         const mask = params.mask orelse return error.MaskRequired;
         try params.validate();
@@ -1268,8 +1259,6 @@ pub const CouplingBatch = struct {
         return total;
     }
 
-    /// Exact inverse of `causalForward`, using the three-step procedure of
-    /// Section 4.8 (recover `X_2`, re-evaluate `K`, then `X_1 = Y_1·e^{−s}`).
     pub fn causalInverse(self: *Self, params: CouplingParamsRef, scratch: *CausalCouplingScratch) !void {
         const mask = params.mask orelse return error.MaskRequired;
         try params.validate();
@@ -1296,9 +1285,6 @@ pub const CouplingBatch = struct {
     }
 };
 
-/// Reusable gather/scatter scratch for the causal coupling path. Allocated
-/// once per traversal and reused across layers and sequences, so the causal
-/// path never allocates in the layer loop.
 pub const CausalCouplingScratch = struct {
     x1: []f32,
     x2: []f32,
@@ -1346,7 +1332,6 @@ pub const CausalCouplingScratch = struct {
     }
 };
 
-/// Splits a `[seq_len, 2*dim]` row block into its contiguous even/odd planes.
 fn gatherHalves(rows: []const f32, seq_len: usize, dim: usize, x1: []f32, x2: []f32) void {
     for (0..seq_len) |t| {
         const base = t * 2 * dim;
@@ -1355,10 +1340,6 @@ fn gatherHalves(rows: []const f32, seq_len: usize, dim: usize, x1: []f32, x2: []
     }
 }
 
-/// Cosine similarity between two single-row latent states, computed in f64
-/// over the interleaved `[dim, 2]` storage. Returns `0` for a zero vector
-/// rather than dividing by zero, and is used to re-weight relational edges
-/// from measured latent geometry.
 pub fn latentCosine(a: RSFLatentState, b: RSFLatentState) !f64 {
     if (a.data.data.len != b.data.data.len) return error.StateShapeMismatch;
     var dot: f64 = 0.0;
@@ -1376,7 +1357,6 @@ pub fn latentCosine(a: RSFLatentState, b: RSFLatentState) !f64 {
     return dot / denom;
 }
 
-/// Reassembles contiguous even/odd planes back into `[seq_len, 2*dim]` rows.
 fn scatterHalves(x1: []const f32, x2: []const f32, seq_len: usize, dim: usize, rows: []f32) void {
     for (0..seq_len) |t| {
         const base = t * 2 * dim;
@@ -1390,9 +1370,7 @@ pub const BatchOperation = union(enum) {
     scale: f64,
     abs: void,
     sqrt: void,
-    /// RSF-native coupling operations. Each carries the validated parameter
-    /// reference; `processVectors` routes them to the coupling batch, never to
-    /// the arithmetic `VectorBatch`.
+
     coupling_forward: CouplingParamsRef,
     coupling_inverse: CouplingParamsRef,
     coupling_adjoint: CouplingParamsRef,
@@ -1516,7 +1494,8 @@ pub const Matrix4x4 = struct {
 
     pub fn frobeniusNorm(self: Self) f32 {
         var sum: f32 = 0;
-        var i: usize = 0; while (i < 4) : (i += 1) {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
             const row_vec = self.data[i];
             const squared = row_vec.mul(row_vec);
             sum += squared.reduce_add();
@@ -1537,10 +1516,13 @@ pub const MatrixOps = struct {
     pub fn matmul4x4(self: *Self, a: Matrix4x4, b: Matrix4x4) Matrix4x4 {
         _ = self;
         var result = Matrix4x4.zero();
-        var i: usize = 0; while (i < 4) : (i += 1) {
-            var j: usize = 0; while (j < 4) : (j += 1) {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            var j: usize = 0;
+            while (j < 4) : (j += 1) {
                 var sum: f32 = 0;
-                var k: usize = 0; while (k < 4) : (k += 1) {
+                var k: usize = 0;
+                while (k < 4) : (k += 1) {
                     sum += a.get(i, k) * b.get(k, j);
                 }
                 result.set(i, j, sum);
@@ -1552,7 +1534,8 @@ pub const MatrixOps = struct {
     pub fn matmul4x4Simd(self: *Self, a: Matrix4x4, b: Matrix4x4) Matrix4x4 {
         const b_t = self.transpose4x4(b);
         var result: [4]F32x4 = undefined;
-        var i: usize = 0; while (i < 4) : (i += 1) {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
             const row_a = a.data[i];
             result[i] = F32x4.initFromArray(.{
                 row_a.dot(b_t.data[0]),
@@ -1567,8 +1550,10 @@ pub const MatrixOps = struct {
     pub fn transpose4x4(self: *Self, m: Matrix4x4) Matrix4x4 {
         _ = self;
         var result = Matrix4x4.zero();
-        var i: usize = 0; while (i < 4) : (i += 1) {
-            var j: usize = 0; while (j < 4) : (j += 1) {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            var j: usize = 0;
+            while (j < 4) : (j += 1) {
                 result.set(j, i, m.get(i, j));
             }
         }
@@ -1577,7 +1562,8 @@ pub const MatrixOps = struct {
 
     pub fn determinant4x4(self: *Self, m: Matrix4x4) f32 {
         var det: f32 = 0;
-        var i: usize = 0; while (i < 4) : (i += 1) {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
             const minor = self.minor3x3(m, 0, i);
             const sign: f32 = if (i % 2 == 0) 1.0 else -1.0;
             det += sign * m.get(0, i) * minor;
@@ -1589,10 +1575,12 @@ pub const MatrixOps = struct {
         _ = self;
         var submatrix: [3][3]f32 = undefined;
         var si: usize = 0;
-        var i: usize = 0; while (i < 4) : (i += 1) {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
             if (i == skip_row) continue;
             var sj: usize = 0;
-            var j: usize = 0; while (j < 4) : (j += 1) {
+            var j: usize = 0;
+            while (j < 4) : (j += 1) {
                 if (j == skip_col) continue;
                 submatrix[si][sj] = m.get(i, j);
                 sj += 1;
@@ -1612,8 +1600,10 @@ pub const MatrixOps = struct {
             return null;
         }
         var adj = Matrix4x4.zero();
-        var i: usize = 0; while (i < 4) : (i += 1) {
-            var j: usize = 0; while (j < 4) : (j += 1) {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            var j: usize = 0;
+            while (j < 4) : (j += 1) {
                 const minor = self.minor3x3(m, i, j);
                 const sign: f32 = if ((i + j) % 2 == 0) 1.0 else -1.0;
                 adj.set(j, i, sign * minor / det);
@@ -1625,75 +1615,52 @@ pub const MatrixOps = struct {
     pub fn qr_decomposition(self: *Self, m: Matrix4x4) struct { q: Matrix4x4, r: Matrix4x4 } {
         _ = self;
         var q = Matrix4x4.identity();
-        var r = m;
-        var k: usize = 0;
-        while (k < 4) : (k += 1) {
-            var col_k: [4]f32 = undefined;
-            {
-                var idx: usize = 0;
-                while (idx < 4) : (idx += 1) {
-                    col_k[idx] = r.get(idx, k);
-                }
-            }
-            {
-                var j_idx: usize = 0;
-                while (j_idx < k) : (j_idx += 1) {
-                    var dot_prod: f32 = 0;
-                    {
-                        var idx: usize = 0;
-                        while (idx < 4) : (idx += 1) {
-                            dot_prod += q.get(idx, j_idx) * col_k[idx];
-                        }
-                    }
-                    {
-                        var idx: usize = 0;
-                        while (idx < 4) : (idx += 1) {
-                            col_k[idx] -= dot_prod * q.get(idx, j_idx);
-                        }
-                    }
-                    {
-                        var idx: usize = 0;
-                        while (idx < 4) : (idx += 1) {
-                            dot_prod = 0;
-                            var ii: usize = 0;
-                            while (ii < 4) : (ii += 1) {
-                                dot_prod += q.get(ii, j_idx) * col_k[ii];
-                            }
-                            col_k[idx] -= dot_prod * q.get(idx, j_idx);
-                        }
-                    }
+        var r = Matrix4x4.identity();
+        for (0..4) |i| for (0..4) |j| {
+            r.set(i, j, 0);
+        };
+        for (0..4) |k| {
+            var column: [4]f32 = undefined;
+            for (0..4) |i| column[i] = m.get(i, k);
+            var original_norm_sq: f32 = 0;
+            for (column) |value| original_norm_sq += value * value;
+            for (0..2) |_| {
+                for (0..k) |j| {
+                    var projection: f32 = 0;
+                    for (0..4) |i| projection += q.get(i, j) * column[i];
+                    r.set(j, k, r.get(j, k) + projection);
+                    for (0..4) |i| column[i] -= projection * q.get(i, j);
                 }
             }
             var norm_sq: f32 = 0;
-            for (col_k) |v| {
-                norm_sq += v * v;
-            }
-            const norm_val = @sqrt(norm_sq);
-            const rkk = r.get(k, k);
-            const norm_threshold = 1e-10 * @max(1.0, if (rkk >= 0) rkk else -rkk);
-            if (norm_val > norm_threshold) {
-                var idx: usize = 0;
-                while (idx < 4) : (idx += 1) {
-                    q.set(idx, k, col_k[idx] / norm_val);
-                }
-            }
-            {
-                var j_idx: usize = k;
-                while (j_idx < 4) : (j_idx += 1) {
-                    var dot_prod: f32 = 0;
-                    var idx: usize = 0;
-                    while (idx < 4) : (idx += 1) {
-                        dot_prod += q.get(idx, k) * r.get(idx, j_idx);
+            for (column) |value| norm_sq += value * value;
+            var norm = @sqrt(norm_sq);
+            r.set(k, k, norm);
+            if (norm <= 8 * std.math.floatEps(f32) * @sqrt(original_norm_sq)) {
+                r.set(k, k, 0);
+                var best: [4]f32 = undefined;
+                var best_norm: f32 = -1;
+                for (0..4) |axis| {
+                    var candidate = [_]f32{0} ** 4;
+                    candidate[axis] = 1;
+                    for (0..2) |_| {
+                        for (0..k) |j| {
+                            var projection: f32 = 0;
+                            for (0..4) |i| projection += q.get(i, j) * candidate[i];
+                            for (0..4) |i| candidate[i] -= projection * q.get(i, j);
+                        }
                     }
-                    r.set(k, j_idx, dot_prod);
+                    var candidate_norm: f32 = 0;
+                    for (candidate) |value| candidate_norm += value * value;
+                    if (candidate_norm > best_norm) {
+                        best = candidate;
+                        best_norm = candidate_norm;
+                    }
                 }
+                column = best;
+                norm = @sqrt(best_norm);
             }
-            {
-                var idx: usize = k + 1;
-                while (idx < 4) : (idx += 1) {
-                    r.set(idx, k, 0);
-                }
-            }
+            for (0..4) |i| q.set(i, k, column[i] / norm);
         }
         return .{ .q = q, .r = r };
     }
@@ -1796,7 +1763,8 @@ pub const RelationalVectorOps = struct {
         _ = &self.similarity_weight_phase;
         errdefer results.deinit();
         const count = @min(vectors1.len, vectors2.len);
-        var i: usize = 0; while (i < count) : (i += 1) {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
             try results.append(vectors1[i].dot(vectors2[i]));
         }
         return results;
@@ -1832,12 +1800,14 @@ pub const RelationalVectorOps = struct {
             }
             laplacian.deinit();
         }
-        var i: usize = 0; while (i < n) : (i += 1) {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
             var row_list = ArrayList(f64).init(self.allocator);
             errdefer row_list.deinit();
             var degree: f64 = 0;
             {
-                var j: usize = 0; while (j < n) : (j += 1) {
+                var j: usize = 0;
+                while (j < n) : (j += 1) {
                     const adj_val = if (i < adjacency.len and j < adjacency[i].len)
                         adjacency[i][j]
                     else
@@ -1847,7 +1817,8 @@ pub const RelationalVectorOps = struct {
                     }
                 }
             }
-            var j: usize = 0; while (j < n) : (j += 1) {
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
                 const adj_val = if (i < adjacency.len and j < adjacency[i].len)
                     adjacency[i][j]
                 else
@@ -1878,9 +1849,11 @@ pub const RelationalVectorOps = struct {
             laplacian.deinit();
         }
         const actual_dims = @min(dimensions, 4);
-        var i: usize = 0; while (i < n) : (i += 1) {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
             var embedding: [4]f64 = .{ 0, 0, 0, 0 };
-            var d: usize = 0; while (d < actual_dims) : (d += 1) {
+            var d: usize = 0;
+            while (d < actual_dims) : (d += 1) {
                 if (i < laplacian.items.len and d < laplacian.items[i].items.len) {
                     embedding[d] = laplacian.items[i].items[d];
                 }
@@ -1936,7 +1909,8 @@ pub const MemoryPool = struct {
 
     pub fn alloc(self: *Self, size: usize) ?[]align(32) u8 {
         const aligned_size = std.mem.alignForward(usize, @max(size, MIN_ALLOCATION_SIZE), 32);
-        var i: usize = 0; while (i < self.free_list.items.len) : (i += 1) {
+        var i: usize = 0;
+        while (i < self.free_list.items.len) : (i += 1) {
             var slice = &self.free_list.items[i];
             if (!slice.in_use and slice.size >= aligned_size) {
                 if (slice.size > aligned_size + MIN_ALLOCATION_SIZE) {
@@ -2212,7 +2186,8 @@ pub const VectorCache = struct {
         if (self.entries.get(key)) |existing| {
             self.allocator.free(existing.data);
             _ = self.entries.remove(key);
-            var i: usize = 0; while (i < self.lru_queue.items.len) : (i += 1) {
+            var i: usize = 0;
+            while (i < self.lru_queue.items.len) : (i += 1) {
                 if (self.lru_queue.items[i] == key) {
                     _ = self.lru_queue.orderedRemove(i);
                     break;
@@ -2233,7 +2208,8 @@ pub const VectorCache = struct {
     }
 
     fn updateLRU(self: *Self, key: u64) void {
-        var i: usize = 0; while (i < self.lru_queue.items.len) : (i += 1) {
+        var i: usize = 0;
+        while (i < self.lru_queue.items.len) : (i += 1) {
             if (self.lru_queue.items[i] == key) {
                 _ = self.lru_queue.orderedRemove(i);
                 self.lru_queue.append(key) catch {};
@@ -2272,15 +2248,11 @@ pub const VectorCache = struct {
 pub const VPU = struct {
     memory_pool: MemoryPool,
     vector_batch: VectorBatch,
-    /// RSF-native coupling lane batch. The arithmetic `vector_batch` above is
-    /// retained for the quantum/LNS/SIMD utility paths; every RSF coupling
-    /// operation in this facade runs through this batch instead.
+
     coupling_batch: CouplingBatch,
-    /// Adjoint counterpart of `coupling_batch`: same geometry, holds the
-    /// incoming output gradient on entry and `∂L/∂x` on return.
+
     gradient_batch: CouplingBatch,
-    /// Accumulated parameter gradients for the layer currently being executed,
-    /// each `[dim, 2]` in a layer `.gradient` tensor's layout.
+
     parameterGradS: []f32,
     parameterGradT: []f32,
     statistics: VPUStatistics,
@@ -2357,9 +2329,6 @@ pub const VPU = struct {
         self.cycle_count += 1;
     }
 
-    /// Routes the RSF coupling batch operations. Every path validates the
-    /// parameter bindings first, so an unbound or foreign-model tensor is
-    /// rejected with a typed error instead of being executed.
     fn processCouplingBatch(self: *Self, operation: BatchOperation) !void {
         const rows = self.coupling_batch.count;
         if (rows == 0) {
@@ -2403,18 +2372,6 @@ pub const VPU = struct {
         self.cycle_count += 1;
     }
 
-    /// Adjoint of the canonical coupling over the whole batch.
-    ///
-    /// `coupling_batch` holds the layer *inputs* `(x1, x2)` and
-    /// `gradient_batch` holds the incoming output gradient `(dy1, dy2)`; on
-    /// return `gradient_batch` holds `∂L/∂x` for the layer input and the four
-    /// parameter-gradient channels have been accumulated into
-    /// `self.parameterGradS` / `self.parameterGradT` (each `[dim, 2]`, laid out
-    /// exactly like a layer's `.gradient` tensor so they can be handed straight
-    /// to `RSF.accumulateLayerGradients`). No activation is stored anywhere:
-    /// the forward state inside `couplingAdjointRow` is recomputed from the
-    /// inputs, which is the same recomputation discipline the fused backward
-    /// kernel uses.
     pub fn couplingAdjointBatch(self: *Self, params: CouplingParamsRef) !void {
         try params.validate();
         const dim = self.coupling_batch.dim;
@@ -2445,9 +2402,6 @@ pub const VPU = struct {
         }
     }
 
-    /// Binds both coupling batches to a model and clears any previous rows.
-    /// The parameter-gradient accumulators are (re)allocated zeroed at
-    /// `[dim, 2]` each, matching a layer's `.gradient` tensor layout.
     pub fn bindCouplingBatch(self: *Self, model: *const RSF) !void {
         const dim = try model.dim();
         const binding = try model.latentBinding();
@@ -2482,10 +2436,6 @@ pub const VPU = struct {
         return self.coupling_batch.count;
     }
 
-    /// Deterministically hashes a node's payload into a `2*dim` latent row
-    /// scaled to `[-1, 1]`. FNV-1a over the bytes seeds a splitmix64 stream,
-    /// so the same graph always produces the same latents on every run and on
-    /// every host — no PRNG state, no allocation beyond the output.
     pub fn hashNodePayload(node_data: []const u8, dim: usize, out: []f32) !void {
         if (dim == 0) return error.ZeroDimension;
         if (out.len != dim * 2) return error.StateShapeMismatch;
@@ -2506,16 +2456,6 @@ pub const VPU = struct {
         }
     }
 
-    /// Flows every node of a relational graph through `model`, replacing the
-    /// NSIR topology embedding with a real RSF latent per node.
-    ///
-    /// Each node's payload is hashed deterministically into a one-row
-    /// `RSFLatentState` (see `hashNodePayload`), flowed through the whole stack
-    /// with `forwardLatentWithLogDet`, and stored with its measured per-row
-    /// log-det. Edge weights are then set to the cosine of the endpoint
-    /// latents through `SelfSimilarRelationalGraph.updateEdgeWeight` — the
-    /// graph's own edge API, so the relational structure is re-weighted by
-    /// measured latent geometry rather than by a synthetic value.
     pub fn computeGraphLatents(
         self: *Self,
         graph: *SelfSimilarRelationalGraph,
@@ -2563,7 +2503,6 @@ pub const VPU = struct {
             self.statistics.coupling_ops += try model.layerCount();
         }
 
-        // Re-weight the edges by the measured cosine of the endpoint latents.
         for (0..ids.len) |a| {
             for (0..ids.len) |b| {
                 if (a == b) continue;
@@ -2578,12 +2517,6 @@ pub const VPU = struct {
         return latents;
     }
 
-    /// Applies `layers` coupling forwards to a single latent row, gated per
-    /// channel by `mask`'s row bits: a set bit applies the coupling to that
-    /// coordinate, a cleared bit leaves it untouched (per-channel bypass).
-    ///
-    /// The mask must carry `2*dim` columns for the state's dim. All bits set
-    /// reduces exactly to the ordinary forward; no bits set is the identity.
     pub fn scatterFlowPropagate(
         self: *Self,
         state: *RSFLatentState,
@@ -2618,8 +2551,6 @@ pub const VPU = struct {
             try model.readLayerWeights(layer, s_params, t_params);
             const params = try core_tensor.RSFCouplingParams.init(s_params, t_params, dim, core_tensor.rsf_default_clip_min, core_tensor.rsf_default_clip_max);
 
-            // Gather the row, apply the coupling to every channel, then write
-            // back only the channels whose mask bit is set.
             var d: usize = 0;
             while (d < dim) : (d += 1) {
                 blocked[d] = try even.get(0, d);
@@ -2643,9 +2574,6 @@ pub const VPU = struct {
         self.cycle_count += depth;
     }
 
-    /// Builds a `[nodes, 2*dim]` bitmask of the latent channels whose
-    /// magnitude exceeds `threshold` — a measured sparsity signal for the
-    /// scatter-flow scheduler, not an estimate.
     pub fn latentChannelMask(
         self: *Self,
         latents: []RSFLatentState,
@@ -2670,9 +2598,6 @@ pub const VPU = struct {
         return matrix;
     }
 
-    /// Flows a latent state through `model`, measuring the same statistics the
-    /// other entry points do. Convenience wrapper used by the R-GPU fabric and
-    /// by the cross-module invariant suite.
     pub fn flowLatent(self: *Self, model: *RSF, state: *RSFLatentState) !void {
         state.log_det += try model.forwardLatentWithLogDet(state);
         self.statistics.latents_flowed += 1;
@@ -2684,7 +2609,8 @@ pub const VPU = struct {
         var results = ArrayList(Matrix4x4).init(self.allocator);
         errdefer results.deinit();
         const count_val = @min(matrices_a.len, matrices_b.len);
-        var i: usize = 0; while (i < count_val) : (i += 1) {
+        var i: usize = 0;
+        while (i < count_val) : (i += 1) {
             const result = self.matrix_ops.matmul4x4Simd(matrices_a[i], matrices_b[i]);
             try results.append(result);
             self.statistics.matrix_operations += 1;
@@ -2734,11 +2660,13 @@ pub const VPU = struct {
         for (embeddings) |emb| {
             try magnitudes.append(emb.magnitude());
         }
-        var i: usize = 0; while (i < embeddings.len) : (i += 1) {
+        var i: usize = 0;
+        while (i < embeddings.len) : (i += 1) {
             var row = ArrayList(f64).init(self.allocator);
             errdefer row.deinit();
             const mag_i = magnitudes.items[i];
-            var j: usize = 0; while (j < embeddings.len) : (j += 1) {
+            var j: usize = 0;
+            while (j < embeddings.len) : (j += 1) {
                 const dot = embeddings[i].dot(embeddings[j]);
                 const mag_j = magnitudes.items[j];
                 const denom = mag_i * mag_j;
@@ -2758,9 +2686,11 @@ pub const VPU = struct {
     pub fn powerIteration(self: *Self, m: Matrix4x4, iterations: usize) F32x4 {
         var v = F32x4.initFromArray(.{ 1, 0, 0, 0 }).normalize();
         var prev_v = v;
-        var iter_idx: usize = 0; while (iter_idx < iterations) : (iter_idx += 1) {
+        var iter_idx: usize = 0;
+        while (iter_idx < iterations) : (iter_idx += 1) {
             var result = F32x4.init(0);
-            var i: usize = 0; while (i < 4) : (i += 1) {
+            var i: usize = 0;
+            while (i < 4) : (i += 1) {
                 const row_vec = m.row(i);
                 const dot = row_vec.dot(v);
                 result.set(i, dot);

@@ -1,22 +1,3 @@
-//! Phase 13: cross-module RSF-native invariant suite.
-//!
-//! Every test here is executable without the Futhark toolchain: the tensor,
-//! OFTB, SFD, NSIR, VPU and R-GPU level invariants are reached through APIs
-//! that do not call an accelerator entry point, so the suite links and runs on
-//! the CPU backend alone. Tests that require the generated accelerator C live
-//! in the accel-backed spec.
-//!
-//! Gate coverage:
-//!   gate 10 — `rsfNative_exactSpectralEquivalence`
-//!   gate 11 — `rsfNative_blockNaturalGradient`, `rsfNative_sfdConvergence`
-//!   gate 12 — `rsfNative_diffusionGlobalMixing`
-//!   gate 13 — `rsfNative_causalCrossTokenFlow`
-//!   gate 14 — `rsfNative_bitplanePropagation`
-//!   gate 15 — `rsfNative_invariantParadigm`
-//!   gate 5  — `rsfNative_bindingEnforcement`
-//!   gate 9(a)— `rsfNative_midpointDepthAccounting`
-//!   gate 3/7 — `rsfNative_rgpuShardedEquivalence`
-
 const std = @import("std");
 const jaide = @import("jaide");
 const tensor = jaide.tensor;
@@ -24,10 +5,6 @@ const types = jaide.types;
 const sfd = jaide.sfd;
 const nsir = jaide.nsir_core;
 const oftb_mod = jaide.oftb;
-
-// ---------------------------------------------------------------------------
-// Deterministic PRNG (splitmix64) so every sweep is reproducible.
-// ---------------------------------------------------------------------------
 
 const Rng = struct {
     state: u64,
@@ -44,7 +21,6 @@ const Rng = struct {
         return z ^ (z >> 31);
     }
 
-    /// Uniform in [-1, 1).
     fn nextF32(self: *Rng) f32 {
         const v = self.nextU64() >> 40;
         return @as(f32, @floatFromInt(v)) / 8388608.0 - 1.0;
@@ -56,13 +32,6 @@ const Rng = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Independent references. These deliberately avoid every production kernel so
-// a shared bug cannot make a test pass against itself.
-// ---------------------------------------------------------------------------
-
-/// f64 Jacobi eigenvalue iteration on the 2x2 Gram matrix G = WᵀW. Returns
-/// sqrt of the larger eigenvalue, i.e. σ_max(W), in double precision.
 fn jacobiSingularValueRank2(w0: []const f32, w1: []const f32) f64 {
     var a: f64 = 0.0;
     var b: f64 = 0.0;
@@ -74,13 +43,12 @@ fn jacobiSingularValueRank2(w0: []const f32, w1: []const f32) f64 {
         b += xf * yf;
         c += yf * yf;
     }
-    // Closed-form eigenvalues of [[a,b],[b,c]] computed in f64, then refined
-    // by one Jacobi rotation so a*b != 0 cases are cross-checked.
+
     const tr = a + c;
     const diff = a - c;
     const disc = @sqrt(diff * diff + 4.0 * b * b);
     var lambda_max = 0.5 * (tr + disc);
-    // Jacobi refinement: rotate to diagonalise and recompute.
+
     if (@abs(b) > 1e-18) {
         const theta = 0.5 * std.math.atan(2.0 * b / (diff + 1e-300));
         const ct = @cos(theta);
@@ -92,8 +60,6 @@ fn jacobiSingularValueRank2(w0: []const f32, w1: []const f32) f64 {
     return @sqrt(@max(0.0, lambda_max));
 }
 
-/// Brute-force reference: max over θ of ‖W·(cosθ, sinθ)‖ over a dense angular
-/// sweep. This is a genuinely independent check of the closed form.
 fn angularSweepSingularValue(w0: []const f32, w1: []const f32, samples: usize) f64 {
     var best: f64 = 0.0;
     var i: usize = 0;
@@ -110,10 +76,6 @@ fn angularSweepSingularValue(w0: []const f32, w1: []const f32, samples: usize) f
     }
     return @sqrt(best);
 }
-
-// ---------------------------------------------------------------------------
-// Gate 10: exact rank-2 spectral normalization
-// ---------------------------------------------------------------------------
 
 test "rsfNative_exactSpectralEquivalence" {
     const allocator = std.testing.allocator;
@@ -146,9 +108,7 @@ test "rsfNative_exactSpectralEquivalence" {
             const sweep = angularSweepSingularValue(w0, w1, 4096);
 
             worst_jacobi = @max(worst_jacobi, @abs(@as(f64, exact) - jacobi));
-            // The angular sweep is a lower bound on σ_max (it samples, it does
-            // not optimise), so only assert it never exceeds the closed form by
-            // more than the tolerance.
+
             const gap = @as(f64, exact) - sweep;
             if (gap < -2.0e-6) worst_sweep = @max(worst_sweep, -gap);
             matrices += 1;
@@ -171,7 +131,6 @@ test "rsfNative_spectralConstraintIsSinglePassAndLeavesSmallMatricesAlone" {
         var w = try tensor.Tensor.initCoupling(allocator, types.RSFBinding.layer(.layer_weight_s, 7, 0, rows));
         defer w.deinit();
 
-        // Half the sweep starts below the target: those must survive untouched.
         const amplitude: f32 = if (iter % 2 == 0) 0.001 else 40.0;
         for (0..rows) |i| {
             w.data[i * 2 + 0] = rng.nextF32() * amplitude;
@@ -194,10 +153,6 @@ test "rsfNative_spectralConstraintIsSinglePassAndLeavesSmallMatricesAlone" {
     try std.testing.expect(rescaled > 0);
 }
 
-// ---------------------------------------------------------------------------
-// Gate 11: analytic 2x2 block-diagonal natural gradient
-// ---------------------------------------------------------------------------
-
 test "rsfNative_blockNaturalGradient" {
     var rng = Rng.init(0xB10C_2024);
     var worst_identity: f64 = 0.0;
@@ -206,7 +161,6 @@ test "rsfNative_blockNaturalGradient" {
 
     var iter: usize = 0;
     while (iter < 10000) : (iter += 1) {
-        // Random SPD 2x2 block: A, C > 0 with AC - B² > 0.
         const a0 = rng.nextF32();
         const c0 = rng.nextF32();
         const b0 = rng.nextF32();
@@ -216,15 +170,12 @@ test "rsfNative_blockNaturalGradient" {
         const B: f64 = @as(f64, rho) * @sqrt(A * C);
         const lambda: f64 = 1e-8;
 
-        // blockInverseSqrt takes the raw (A, B, C) and applies the damping
-        // λ itself; M = [[A,B],[B,C]] + λI is what it inverts the root of.
         const m00 = A + lambda;
         const m11 = C + lambda;
         const m01 = B;
 
         const inv = sfd.blockInverseSqrt(A, B, C, lambda);
 
-        // ‖M^{-1/2} M M^{-1/2} − I‖₂
         const k00 = inv.inv00 * m00 + inv.inv01 * m01;
         const k01 = inv.inv00 * m01 + inv.inv01 * m11;
         const k10 = inv.inv01 * m00 + inv.inv11 * m01;
@@ -238,14 +189,10 @@ test "rsfNative_blockNaturalGradient" {
         const norm = @sqrt(@max(e00 * e00 + p01 * p01, p10 * p10 + e11 * e11));
         worst_identity = @max(worst_identity, norm);
 
-        // Symmetry + positive definiteness of M^{-1/2}.
         try std.testing.expect(@abs(inv.inv01 - inv.inv01) < 1e-30);
         try std.testing.expect(inv.inv00 > 0.0);
         try std.testing.expect(inv.inv11 > 0.0);
 
-        // Condition number bookkeeping: (1+|ρ|)/(1−|ρ|) is the diagonal
-        // preconditioner's residual condition number; the block form reduces
-        // it to 1.
         const abs_rho = @abs(@as(f64, rho));
         if (abs_rho < 1.0) {
             const residual = (1.0 + abs_rho) / (1.0 - abs_rho);
@@ -255,7 +202,6 @@ test "rsfNative_blockNaturalGradient" {
     try std.testing.expect(worst_identity < 1e-5);
     try std.testing.expect(worst_cond > 1.0);
 
-    // Degeneracy: B = 0 must reduce exactly to the diagonal step.
     iter = 0;
     while (iter < 1000) : (iter += 1) {
         const A: f64 = @abs(@as(f64, rng.nextF32())) * 8.0 + 1e-2;
@@ -268,10 +214,6 @@ test "rsfNative_blockNaturalGradient" {
     }
     try std.testing.expect(worst_degenerate < 1e-6);
 }
-
-// ---------------------------------------------------------------------------
-// Gate 12: global cross-channel diffusion Θ = Q_r ⊗ H_{2^k}
-// ---------------------------------------------------------------------------
 
 fn diffusionLayoutOf(row_len: usize) types.RSFDiffusionLayout {
     return types.rsfDiffusionLayout(row_len).?;
@@ -293,15 +235,13 @@ fn checkDiffusionInvariants(row_len: usize, seed: u64) !void {
     @memcpy(once, x);
 
     try tensor.diffuseRowInPlace(x, layout);
-    // Θ is its own inverse, so a second application returns the input.
+
     try tensor.diffuseRowInPlace(x, layout);
 
-    // Θ(Θ(x)) = x to 1e-7 in ∞-norm.
     for (orig, x) |want, back| {
         try std.testing.expect(@abs(want - back) < 1e-7);
     }
 
-    // Energy preservation ‖Θ(x)‖₂ = ‖x‖₂ to 1e-7.
     try tensor.diffuseRowInPlace(once, layout);
     var n_in: f64 = 0.0;
     var n_out: f64 = 0.0;
@@ -311,14 +251,11 @@ fn checkDiffusionInvariants(row_len: usize, seed: u64) !void {
     }
     try std.testing.expect(@abs(@sqrt(n_in) - @sqrt(n_out)) < 1e-7);
 
-    // Zero log-det contribution: |det Θ| = 1 exactly, so the implementation
-    // reports 0 for the OFTB product it participates in.
     var oftb_inst = try oftb_mod.OFTB.initWithDiffusion(row_len / 2, true);
     try std.testing.expectEqual(@as(f32, 0.0), oftb_inst.logDetContribution());
 }
 
 test "rsfNative_diffusionGlobalMixing" {
-    // Production geometry and the small geometries used by tests.
     const row_lens = [_]usize{ 2, 4, 8, 24, 32, 96, 32768 * 3 };
     for (row_lens) |len| {
         try checkDiffusionInvariants(len, 0xD1FF_0000 + len);
@@ -326,15 +263,12 @@ test "rsfNative_diffusionGlobalMixing" {
 
     const allocator = std.testing.allocator;
 
-    // Production geometry decomposition: row_len = 98304 = 3 · 2^15.
     const prod = diffusionLayoutOf(98304);
     try std.testing.expectEqual(@as(usize, 98304), prod.row_len);
     try std.testing.expectEqual(@as(usize, 3), prod.radix);
     try std.testing.expectEqual(@as(usize, 32768), prod.block);
     try std.testing.expectEqual(@as(usize, 15), prod.stages);
 
-    // Cross-channel mixing: a single-coordinate perturbation must reach every
-    // one of the r blocks.
     const layout = diffusionLayoutOf(24);
     try std.testing.expectEqual(@as(usize, 3), layout.radix);
     try std.testing.expectEqual(@as(usize, 8), layout.block);
@@ -351,7 +285,6 @@ test "rsfNative_diffusionGlobalMixing" {
         try std.testing.expect(reached);
     }
 
-    // Θ equals its own transpose: ⟨Θa, b⟩ = ⟨a, Θb⟩.
     const a = try allocator.alloc(f32, 24);
     defer allocator.free(a);
     const b = try allocator.alloc(f32, 24);
@@ -373,18 +306,12 @@ test "rsfNative_diffusionGlobalMixing" {
     for (a, tb) |x, y| rhs += @as(f64, x) * @as(f64, y);
     try std.testing.expect(@abs(lhs - rhs) < 1e-6);
 
-    // r == 1 (pure power-of-two row) is still an exact involution.
     try checkDiffusionInvariants(32, 0xFACE_0001);
 
-    // Non-power-of-two blocks are rejected by the primitive.
     const bad = try allocator.alloc(f32, 6);
     defer allocator.free(bad);
     try std.testing.expectError(error.InvalidDimension, tensor.walshHadamardInPlace(bad));
 }
-
-// ---------------------------------------------------------------------------
-// Gate 13: causal cross-token relational coupling
-// ---------------------------------------------------------------------------
 
 test "rsfNative_causalCrossTokenFlow" {
     const allocator = std.testing.allocator;
@@ -419,16 +346,12 @@ test "rsfNative_causalCrossTokenFlow" {
     const logdet = try tensor.causalCouplingForwardBatch(&state, &mask, &s_w, &t_w, -5.0, 5.0, scratch_k);
     try tensor.causalCouplingInverseBatch(&state, &mask, &s_w, &t_w, -5.0, 5.0, scratch_k, scratch_x2);
 
-    // Gate 13 inversion bound.
     var worst: f32 = 0.0;
     for (state.data, original.data) |got, want| {
         worst = @max(worst, @abs(got - want));
     }
     try std.testing.expect(worst < 5.0e-7);
 
-    // Causality: perturbing token t' must leave the *outputs* at tokens
-    // t < t' bit-identical. The comparison is between two forward passes -
-    // one on the original sequence and one on the perturbed sequence.
     var probe = try tensor.Tensor.initLatent(allocator, model_id, dim, seq_len);
     defer probe.deinit();
     try probe.copyFrom(&original);
@@ -450,8 +373,7 @@ test "rsfNative_causalCrossTokenFlow" {
             }
         }
     }
-    // And the perturbation must actually change something at or after t',
-    // otherwise the test could pass vacuously.
+
     var changed_after = false;
     for (perturbed_token..seq_len) |t| {
         for (0..dim * 2) |i| {
@@ -461,8 +383,6 @@ test "rsfNative_causalCrossTokenFlow" {
     }
     try std.testing.expect(changed_after);
 
-    // Log-det is Σ_t Σ_d s_{t,d}: recomputed independently from the recovered
-    // X_2 prefix sums.
     var expected_logdet: f64 = 0.0;
     const work = try allocator.alloc(f32, seq_len * dim);
     defer allocator.free(work);
@@ -504,19 +424,6 @@ test "rsfNative_causalZeroMaskAndNonTriangularMasks" {
     const scratch_x2 = try allocator.alloc(f32, seq_len * dim);
     defer allocator.free(scratch_x2);
 
-    // An all-zero mask empties every prefix sum, so K_t = 0 and therefore
-    // s_t = clip(b_s) - a scale that is CONSTANT across tokens. This is the
-    // exact behaviour the Section 4.8 formula prescribes.
-    //
-    // NOTE (documented deviation): the source plan additionally asks that an
-    // all-zero mask "reproduce the per-token path exactly" (Phase 0 fixture
-    // (h)). Under the normative definition K_t = Σ_{t'<t} C[t,t']·X_2,t' the
-    // two cannot coincide: the per-token coupling uses s = clip(w·x2 + b),
-    // which is what K_t = X_2,t would give, and C[t,t] = 0 is forced by strict
-    // lower triangularity. Special-casing an empty mask to a different formula
-    // would create a discontinuous semantic at nnz = 0 and would make the
-    // documented inverse inconsistent with the forward, so the normative
-    // formula is kept and the difference is recorded here instead.
     const logdet_zero = try tensor.causalCouplingForwardBatch(&state, &zero_mask, &s_w, &t_w, -5.0, 5.0, scratch_k);
     var expected_zero_logdet: f64 = 0.0;
     for (0..dim) |d| {
@@ -525,13 +432,11 @@ test "rsfNative_causalZeroMaskAndNonTriangularMasks" {
     }
     try std.testing.expect(@abs(@as(f64, logdet_zero) - expected_zero_logdet) < 1e-4);
 
-    // Inverse still recovers the input exactly with an empty mask.
     var recovered = try state.clone(allocator);
     defer recovered.deinit();
     try tensor.causalCouplingInverseBatch(&recovered, &zero_mask, &s_w, &t_w, -5.0, 5.0, scratch_k, scratch_x2);
     for (0..seq_len) |t| {
         for (0..dim) |d| {
-            // Y_1,t = X_1,t · exp(s_t) with s_t constant across t.
             const s_t = @max(-5.0, @min(5.0, s_w.data[d * 2 + 1]));
             const y1 = state.data[(t * dim + d) * 2 + 0];
             const y2 = state.data[(t * dim + d) * 2 + 1];
@@ -542,24 +447,21 @@ test "rsfNative_causalZeroMaskAndNonTriangularMasks" {
         }
     }
 
-    // Masks that are not strictly lower triangular, or whose bytes are not in
-    // {0,1}, are rejected with a typed error.
     var bytes = try allocator.alloc(u8, seq_len * seq_len);
     defer allocator.free(bytes);
 
     @memset(bytes, 0);
-    bytes[2 * seq_len + 2] = 1; // j == i
+    bytes[2 * seq_len + 2] = 1;
     try std.testing.expectError(error.InvalidCausalMask, types.RSFSequenceMask.initFromBytes(allocator, seq_len, bytes));
 
     @memset(bytes, 0);
-    bytes[1 * seq_len + 3] = 1; // j > i
+    bytes[1 * seq_len + 3] = 1;
     try std.testing.expectError(error.InvalidCausalMask, types.RSFSequenceMask.initFromBytes(allocator, seq_len, bytes));
 
     @memset(bytes, 0);
-    bytes[3 * seq_len + 1] = 2; // value outside {0,1}
+    bytes[3 * seq_len + 1] = 2;
     try std.testing.expectError(error.InvalidCausalMask, types.RSFSequenceMask.initFromBytes(allocator, seq_len, bytes));
 
-    // `set` refuses non-causal coordinates rather than silently storing them.
     var probe = try types.RSFSequenceMask.initZero(allocator, seq_len);
     defer probe.deinit();
     try std.testing.expectError(error.InvalidCausalMask, probe.set(2, 2));
@@ -588,26 +490,19 @@ test "rsfNative_causalPrefixSumPathsAgreeOnFullCausalMask" {
 
     try tensor.causalPrefixSum(&mask, x2, dim, k_a);
 
-    // Independent running-recurrence reference.
     for (0..dim) |d| k_b[d] = 0.0;
     for (1..seq_len) |t| {
         for (0..dim) |d| k_b[t * dim + d] = k_b[(t - 1) * dim + d] + x2[(t - 1) * dim + d];
     }
     for (k_a, k_b) |a, b| try std.testing.expect(@abs(a - b) < 1e-6);
 
-    // A relational (non-full) mask must not be routed through the running
-    // accumulator: rows have different support, so the recurrence is invalid.
     var band = try types.RSFSequenceMask.initBand(allocator, seq_len, 2);
     defer band.deinit();
     try std.testing.expect(!band.full_causal);
     try band.set(5, 0);
     try std.testing.expect(band.get(5, 0));
-    try std.testing.expect(!band.get(5, 2)); // outside the band of 2
+    try std.testing.expect(!band.get(5, 2));
 }
-
-// ---------------------------------------------------------------------------
-// Gate 14: branchless bit-plane relational propagation
-// ---------------------------------------------------------------------------
 
 test "rsfNative_bitplanePropagation" {
     const allocator = std.testing.allocator;
@@ -641,9 +536,6 @@ test "rsfNative_bitplanePropagation" {
                 }
             }
 
-            // Four signal distributions: all positive, all negative, mixed, one
-            // dominant. The mixed and all-negative cases are the regression
-            // guard for offset-binary quantization.
             const modes = [_]u2{ 0, 1, 2, 3 };
             for (modes) |mode| {
                 for (signal) |*v| {
@@ -681,7 +573,6 @@ test "rsfNative_bitplanePropagation" {
     try std.testing.expect(configs >= 128);
     try std.testing.expect(worst_ratio <= 1.0);
 
-    // decay == 0 and an empty adjacency both reproduce the signal exactly.
     const n: usize = 64;
     const words = nsir.bitmaskWordCount(n);
     const empty = try allocator.alloc(u64, n * words);
@@ -697,7 +588,6 @@ test "rsfNative_bitplanePropagation" {
     nsir.bitmaskSignalPropagateBitPlane(empty, n, signal, 0.0, out);
     for (signal, out) |a, b| try std.testing.expectEqual(a, b);
 
-    // The allocating entry point agrees with the smp_allocator entry point.
     try nsir.bitmaskSignalPropagateWithAllocator(allocator, empty, n, signal, 0.85, out);
     const out2 = try allocator.alloc(f32, n);
     defer allocator.free(out2);
@@ -705,27 +595,20 @@ test "rsfNative_bitplanePropagation" {
     for (out, out2) |a, b| try std.testing.expectEqual(a, b);
 }
 
-// ---------------------------------------------------------------------------
-// Gate 5: RSF binding enforcement across the modules
-// ---------------------------------------------------------------------------
-
 test "rsfNative_bindingEnforcement" {
     const allocator = std.testing.allocator;
     const model_a: u64 = 101;
     const model_b: u64 = 202;
 
-    // A layer-weight tensor refuses to be read as a different space.
     var s_w = try tensor.Tensor.initCoupling(allocator, types.RSFBinding.layer(.layer_weight_s, model_a, 0, 4));
     defer s_w.deinit();
     try std.testing.expectError(types.RSFBindingError.RSFSpaceMismatch, s_w.requireSpace(.layer_weight_t));
 
-    // An unbound tensor carries no binding at all.
     var plain = try tensor.Tensor.init(allocator, &[_]usize{ 4, 2 });
     defer plain.deinit();
     try std.testing.expect(plain.binding() == null);
     try std.testing.expectError(types.RSFBindingError.RSFBindingRequired, plain.requireSpace(.layer_weight_s));
 
-    // Model and layer mismatches are typed errors, never silent coercions.
     var t_w = try tensor.Tensor.initCoupling(allocator, types.RSFBinding.layer(.layer_weight_t, model_b, 1, 4));
     defer t_w.deinit();
     try std.testing.expectError(
@@ -740,7 +623,6 @@ test "rsfNative_bindingEnforcement" {
     try std.testing.expectEqual(model_a, latent_binding.model_id);
     try std.testing.expectError(types.RSFBindingError.RSFDimMismatch, latent_binding.requireDim(8));
 
-    // A mis-modeled coupling tensor is rejected by the causal kernel.
     var foreign_state = try tensor.Tensor.initLatent(allocator, model_b, 4, 2);
     defer foreign_state.deinit();
     var mask = try types.RSFSequenceMask.initCausal(allocator, 2);
@@ -753,16 +635,9 @@ test "rsfNative_bindingEnforcement" {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Gate 15: the invariant paradigm - no dense learned projections anywhere
-// ---------------------------------------------------------------------------
-
 test "rsfNative_invariantParadigm" {
     const allocator = std.testing.allocator;
 
-    // Enumerate every learnable parameter space and assert each is a rank-2
-    // coupling pair: shape [dim, 2] (or [dim, 3] for the block Fisher
-    // statistics, which are not parameters at all).
     const spaces = [_]types.RSFSpace{
         .layer_weight_s, .layer_weight_t, .ranker_head, .master_weight, .momentum, .gradient,
     };
@@ -771,9 +646,6 @@ test "rsfNative_invariantParadigm" {
     }
     try std.testing.expectEqual(@as(usize, 3), types.RSFSpace.fisher_block.columns());
 
-    // The only learned parameters the substrate can hold are the rank-2
-    // coupling pairs; a Fisher block is a statistic, not a parameter, and is
-    // excluded by the enumeration above.
     var s_w = try tensor.Tensor.initCoupling(allocator, types.RSFBinding.layer(.layer_weight_s, 1, 0, 16));
     defer s_w.deinit();
     try std.testing.expectEqual(@as(usize, 2), s_w.shape.dims.len);
@@ -784,8 +656,6 @@ test "rsfNative_invariantParadigm" {
     defer block.deinit();
     try std.testing.expectEqual(@as(usize, 3), block.shape.dims[1]);
 
-    // The orthogonal factors contribute exactly zero log-det: the OFTB reports
-    // it, and the diffusion operator is an exact involution with |det| = 1.
     var oftb_inst = try oftb_mod.OFTB.initWithDiffusion(16, true);
     try std.testing.expectEqual(@as(f32, 0.0), oftb_inst.logDetContribution());
     try std.testing.expect(oftb_inst.isOrthogonal());
@@ -793,3 +663,83 @@ test "rsfNative_invariantParadigm" {
     try std.testing.expectEqual(@as(usize, 8), oftb_mod.OFTB.resonance_order);
 }
 
+test "QR reorthogonalizes complete columns and reconstructs rank deficient matrices" {
+    const vpu = jaide.vpu;
+    var ops = vpu.MatrixOps.init(std.testing.allocator);
+    const matrices = [_]vpu.Matrix4x4{
+        .{ .data = .{ vpu.F32x4.initFromArray(.{ 1, 2, 3, 4 }), vpu.F32x4.initFromArray(.{ 2, 5, 7, 1 }), vpu.F32x4.initFromArray(.{ 3, 1, 4, 2 }), vpu.F32x4.initFromArray(.{ 1, 0, 2, 8 }) } },
+        .{ .data = .{ vpu.F32x4.initFromArray(.{ 1, 2, 0, 4 }), vpu.F32x4.initFromArray(.{ 2, 4, 0, 8 }), vpu.F32x4.initFromArray(.{ 3, 6, 0, 12 }), vpu.F32x4.initFromArray(.{ 4, 8, 0, 16 }) } },
+        vpu.Matrix4x4.zero(),
+    };
+    for (matrices) |matrix| {
+        const qr = ops.qr_decomposition(matrix);
+        const reconstructed = ops.matmul4x4(qr.q, qr.r);
+        const qtq = ops.matmul4x4(ops.transpose4x4(qr.q), qr.q);
+        for (0..4) |i| {
+            for (0..4) |j| {
+                try std.testing.expectApproxEqAbs(matrix.get(i, j), reconstructed.get(i, j), 1e-4);
+                try std.testing.expectApproxEqAbs(@as(f32, if (i == j) 1 else 0), qtq.get(i, j), 1e-5);
+                if (i > j) try std.testing.expectEqual(@as(f32, 0), qr.r.get(i, j));
+            }
+        }
+    }
+}
+
+test "packed GEMM handles odd reduction dimensions and partial tiles" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 3, 5, 9, 17, 129, 257, 259 }) |k| {
+        const m: usize = if (k >= 128) 137 else 17;
+        const n: usize = if (k >= 128) 131 else 19;
+        var a = try tensor.Tensor.init(allocator, &.{ m, k });
+        defer a.deinit();
+        var b = try tensor.Tensor.init(allocator, &.{ k, n });
+        defer b.deinit();
+        for (a.data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 7)) * 0.125;
+        for (b.data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 11)) * 0.0625;
+        var c = try tensor.Tensor.matmul(&a, &b, allocator);
+        defer c.deinit();
+        for (0..m) |i| {
+            for (0..n) |j| {
+                var expected: f32 = 0;
+                for (0..k) |p| expected += a.data[i * k + p] * b.data[p * n + j];
+                try std.testing.expectApproxEqAbs(expected, c.data[i * n + j], 1e-4);
+            }
+        }
+    }
+}
+
+test "VPU coupling follows coupling rotation diffusion order" {
+    const vpu = jaide.vpu;
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |diffusion| {
+        const dim = 4;
+        var sw = try tensor.Tensor.initCoupling(allocator, types.RSFBinding.layer(.layer_weight_s, 23, 0, dim));
+        defer sw.deinit();
+        var tw = try tensor.Tensor.initCoupling(allocator, types.RSFBinding.layer(.layer_weight_t, 23, 0, dim));
+        defer tw.deinit();
+        for (sw.data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i + 1)) * 0.01;
+        for (tw.data, 0..) |*value, i| value.* = -@as(f32, @floatFromInt(i + 1)) * 0.02;
+        var batch = vpu.CouplingBatch.init(allocator, dim, types.RSFBinding.detached(.latent_state, dim));
+        defer batch.deinit();
+        const original = [_]f32{ 0.1, -0.2, 0.3, 0.4, 0.2, -0.4, 0.1, -0.3 };
+        _ = try batch.addRow(&original);
+        _ = try batch.addRow(&original);
+        const params = vpu.CouplingParamsRef{ .model_id = 23, .layer_index = 0, .dim = dim, .s_weight = &sw, .t_weight = &tw, .diffusion = diffusion };
+        var scale: [dim]f32 = undefined;
+        var trans: [dim]f32 = undefined;
+        var expected = original;
+        const coupling = try params.params();
+        _ = try tensor.couplingForwardRows(coupling, &expected, 1, &scale, &trans);
+        var oftb = try oftb_mod.OFTB.initWithDiffusion(dim, diffusion);
+        try oftb.forwardSliceInPlace(&expected);
+        const forward_ld = try batch.forward(params, &scale, &trans);
+        for (0..2) |i| for (try batch.rowConst(i), expected) |actual, reference| {
+            try std.testing.expectApproxEqAbs(reference, actual, 1e-6);
+        };
+        const inverse_ld = try batch.inverse(params, &scale, &trans);
+        try std.testing.expectApproxEqAbs(forward_ld, inverse_ld, 1e-6);
+        for (0..2) |i| for (try batch.rowConst(i), original) |actual, reference| {
+            try std.testing.expectApproxEqAbs(reference, actual, 1e-6);
+        };
+    }
+}

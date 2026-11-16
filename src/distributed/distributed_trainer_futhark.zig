@@ -27,7 +27,7 @@ pub const CHECKPOINT_VERSION = checkpoint_envelope.VERSION;
 pub const CHECKPOINT_TRAILER = checkpoint_envelope.TRAILER;
 pub const sfd_fisher_gamma_default: f32 = 0.99;
 pub const sfd_fisher_epsilon_default: f32 = 1e-8;
-pub const fused_logdet_weight_default: f32 = -1e-3;
+pub const fused_logdet_weight_default: f32 = 1e-3;
 pub const MGTLanguage = @typeInfo(@TypeOf(MGT.init)).@"fn".params[4].type.?;
 pub const TokenizerFactory = *const fn (
     allocator: std.mem.Allocator,
@@ -476,12 +476,6 @@ const StepSynchronizer = struct {
         if (job.apply_embedding_update) {
             if (trainer.gpu_embedding) |*embedding| {
                 if (trainer.coordinator.world_size > 1) {
-                    {
-                        ctx.mutex.lock();
-                        defer ctx.mutex.unlock();
-                        const gradient_scale = if (trainer.config.grad_mean) job.local_fraction else 1.0;
-                        try embedding.scaleGradient(gradient_scale);
-                    }
                     try ctx.sync();
                     var gradient = gradient_buffer: {
                         ctx.mutex.lock();
@@ -654,6 +648,7 @@ pub const DistributedTrainerFuthark = struct {
         if (coordinator.world_size == 0) return TrainerError.InvalidWorldSize;
         if (coordinator.rank >= coordinator.world_size) return TrainerError.InvalidRank;
         if (config.max_line_size == 0) return TrainerError.InvalidMaxLineSize;
+        if (!std.math.isFinite(config.logdet_weight) or config.logdet_weight < 0.0) return TrainerError.InvalidOptimizerConfiguration;
         if (config.checkpoint_version != CHECKPOINT_VERSION) return TrainerError.InvalidCheckpointVersion;
         if (!std.math.isFinite(config.esso_initial_temperature) or config.esso_initial_temperature <= 0.0) return TrainerError.InvalidOptimizerConfiguration;
         if (!std.math.isFinite(config.esso_cooling_rate) or config.esso_cooling_rate <= 0.0 or config.esso_cooling_rate > 1.0) return TrainerError.InvalidOptimizerConfiguration;
@@ -1407,13 +1402,16 @@ pub const DistributedTrainerFuthark = struct {
                 const source_length = std.math.mul(usize, current_batch_size, window_size) catch return TrainerError.ValueOverflow;
                 prepared = try self.prepareTokenBatch(dataset.payload[start .. start + source_length], current_batch_size, self.runtime_max_seq_len, 0);
             } else {
+                self.batch_buffers.lengths[0][0] = 1;
+                self.batch_buffers.inputs[0][0] = 0;
+                self.batch_buffers.targets[0][0] = 0;
                 prepared = PreparedBatch{
                     .allocator = self.allocator,
                     .token_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator),
                     .active_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator),
                     .real_sequence_lengths = self.batch_buffers.lengths[0][0..1],
-                    .flat_input_tokens = self.batch_buffers.inputs[0][0..self.runtime_max_seq_len],
-                    .flat_target_tokens = self.batch_buffers.targets[0][0..self.runtime_max_seq_len],
+                    .flat_input_tokens = self.batch_buffers.inputs[0][0..1],
+                    .flat_target_tokens = self.batch_buffers.targets[0][0..1],
                     .effective_batch_size = 1,
                     .sequence_length = 1,
                     .local_active_samples = 0,
@@ -1678,7 +1676,7 @@ pub const DistributedTrainerFuthark = struct {
             &tensors.targets,
             prepared.real_sequence_lengths,
             self.config.grad_mean,
-            if (self.config.grad_mean) local_fraction else 1.0,
+            if (prepared.local_token_count == 0) @as(f32, 0.0) else if (self.config.grad_mean) local_fraction else 1.0,
             clamped_reconstruction_alpha,
             @as(f32, 1.0),
             self.config.logdet_weight,
@@ -2152,8 +2150,8 @@ pub const DistributedTrainerFuthark = struct {
             try writeF32Array(writer, snapshot.rsf_optimizer_state.master_weights_t, false);
             try writeF32Array(writer, snapshot.rsf_optimizer_state.momentum_s, false);
             try writeF32Array(writer, snapshot.rsf_optimizer_state.momentum_t, false);
-            try writeF32Array(writer, snapshot.rsf_optimizer_state.fisher_s, true);
-            try writeF32Array(writer, snapshot.rsf_optimizer_state.fisher_t, true);
+            try writeF32Array(writer, snapshot.rsf_optimizer_state.fisher_s, false);
+            try writeF32Array(writer, snapshot.rsf_optimizer_state.fisher_t, false);
             if (snapshot.embedding_optimizer_state) |embedding_state| {
                 try writer.writeByte(1);
                 try writer.writeInt(u64, @intCast(snapshot.embedding_vocab), .little);
@@ -2288,7 +2286,7 @@ pub const DistributedTrainerFuthark = struct {
         if (!std.math.isFinite(saved_weight_floor) or saved_weight_floor <= 0.0) return TrainerError.InvalidOptimizerConfiguration;
         if (saved_spectral_interval == 0 or !std.math.isFinite(saved_spectral_target) or saved_spectral_target <= 0.0) return TrainerError.InvalidSpectralState;
         if (!std.math.isFinite(saved_reconstruction_alpha) or saved_reconstruction_alpha < 0.0 or saved_reconstruction_alpha > 1.0) return TrainerError.InvalidOptimizerConfiguration;
-        if (!std.math.isFinite(saved_logdet_weight)) return TrainerError.InvalidOptimizerConfiguration;
+        if (!std.math.isFinite(saved_logdet_weight) or saved_logdet_weight < 0.0) return TrainerError.InvalidOptimizerConfiguration;
         if (!std.math.isFinite(saved_gradient_clip_norm) or saved_gradient_clip_norm <= 0.0) return TrainerError.InvalidGradient;
         if (saved_default_max_seq_len == 0 or saved_default_max_seq_len > self.config.max_distributed_integer) return TrainerError.InvalidEnvironmentValue;
         if (saved_reasoning_cycles == 0) return TrainerError.InvalidOptimizerConfiguration;
@@ -2308,9 +2306,10 @@ pub const DistributedTrainerFuthark = struct {
         defer self.allocator.free(saved_momentum_s);
         const saved_momentum_t = try self.readCheckpointF32Array(reader, total_rsf_state, false);
         defer self.allocator.free(saved_momentum_t);
-        const saved_fisher_s = try self.readCheckpointF32Array(reader, total_rsf_state, true);
+        const total_fisher_state = try std.math.mul(usize, try std.math.mul(usize, half, accel.rsf_fisher_width), self.num_layers);
+        const saved_fisher_s = try self.readCheckpointF32Array(reader, total_fisher_state, false);
         defer self.allocator.free(saved_fisher_s);
-        const saved_fisher_t = try self.readCheckpointF32Array(reader, total_rsf_state, true);
+        const saved_fisher_t = try self.readCheckpointF32Array(reader, total_fisher_state, false);
         defer self.allocator.free(saved_fisher_t);
         const has_embedding = try reader.readByte();
         if (has_embedding > 1) return TrainerError.InvalidCheckpointEmbeddingFlag;

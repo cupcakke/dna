@@ -504,7 +504,7 @@ fn packBAvx512(b: []const f32, ldb: usize, kc: usize, nc: usize, packed_out: []a
 }
 
 noinline fn microKernelAvx2(
-    a_ptr: [*]align(32) const f32,
+    a_ptr: [*]const f32,
     b_ptr: [*]align(32) const f32,
     c_ptr: [*]align(32) f32,
     k: usize,
@@ -696,66 +696,66 @@ noinline fn microKernelAvx512(
 ) void {
     if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f)) {
         asm volatile (
-        \\.intel_syntax noprefix
-        \\vmovaps zmm0, zmmword ptr [rdx]
-        \\vmovaps zmm1, zmmword ptr [rdx + 64]
-        \\vmovaps zmm2, zmmword ptr [rdx + 128]
-        \\vmovaps zmm3, zmmword ptr [rdx + 192]
-        \\vmovaps zmm4, zmmword ptr [rdx + 256]
-        \\vmovaps zmm5, zmmword ptr [rdx + 320]
-        \\vmovaps zmm6, zmmword ptr [rdx + 384]
-        \\vmovaps zmm7, zmmword ptr [rdx + 448]
-        \\lea r10, [rcx * 4]
-        \\test rcx, rcx
-        \\jz .Lgemm512_store
-        \\.Lgemm512_loop:
-        \\vmovaps zmm9, zmmword ptr [rsi]
-        \\mov r11, rdi
-        \\vbroadcastss zmm8, dword ptr [r11]
-        \\vfmadd231ps zmm0, zmm8, zmm9
-        \\add r11, r10
-        \\vbroadcastss zmm8, dword ptr [r11]
-        \\vfmadd231ps zmm1, zmm8, zmm9
-        \\add r11, r10
-        \\vbroadcastss zmm8, dword ptr [r11]
-        \\vfmadd231ps zmm2, zmm8, zmm9
-        \\add r11, r10
-        \\vbroadcastss zmm8, dword ptr [r11]
-        \\vfmadd231ps zmm3, zmm8, zmm9
-        \\add r11, r10
-        \\vbroadcastss zmm8, dword ptr [r11]
-        \\vfmadd231ps zmm4, zmm8, zmm9
-        \\add r11, r10
-        \\vbroadcastss zmm8, dword ptr [r11]
-        \\vfmadd231ps zmm5, zmm8, zmm9
-        \\add r11, r10
-        \\vbroadcastss zmm8, dword ptr [r11]
-        \\vfmadd231ps zmm6, zmm8, zmm9
-        \\add r11, r10
-        \\vbroadcastss zmm8, dword ptr [r11]
-        \\vfmadd231ps zmm7, zmm8, zmm9
-        \\add rdi, 4
-        \\add rsi, 64
-        \\dec rcx
-        \\jnz .Lgemm512_loop
-        \\.Lgemm512_store:
-        \\vmovaps zmmword ptr [rdx], zmm0
-        \\vmovaps zmmword ptr [rdx + 64], zmm1
-        \\vmovaps zmmword ptr [rdx + 128], zmm2
-        \\vmovaps zmmword ptr [rdx + 192], zmm3
-        \\vmovaps zmmword ptr [rdx + 256], zmm4
-        \\vmovaps zmmword ptr [rdx + 320], zmm5
-        \\vmovaps zmmword ptr [rdx + 384], zmm6
-        \\vmovaps zmmword ptr [rdx + 448], zmm7
-        \\vzeroupper
-        \\.att_syntax prefix
-        :
-        : [a] "{rdi}" (a_ptr),
-          [b] "{rsi}" (b_ptr),
-          [c] "{rdx}" (c_ptr),
-          [k] "{rcx}" (k),
-        : "rcx", "rdx", "rsi", "rdi", "r10", "r11", "cc", "memory", "zmm0", "zmm1", "zmm2", "zmm3", "zmm4", "zmm5", "zmm6", "zmm7", "zmm8", "zmm9"
-    );
+            \\.intel_syntax noprefix
+            \\vmovaps zmm0, zmmword ptr [rdx]
+            \\vmovaps zmm1, zmmword ptr [rdx + 64]
+            \\vmovaps zmm2, zmmword ptr [rdx + 128]
+            \\vmovaps zmm3, zmmword ptr [rdx + 192]
+            \\vmovaps zmm4, zmmword ptr [rdx + 256]
+            \\vmovaps zmm5, zmmword ptr [rdx + 320]
+            \\vmovaps zmm6, zmmword ptr [rdx + 384]
+            \\vmovaps zmm7, zmmword ptr [rdx + 448]
+            \\lea r10, [rcx * 4]
+            \\test rcx, rcx
+            \\jz .Lgemm512_store
+            \\.Lgemm512_loop:
+            \\vmovaps zmm9, zmmword ptr [rsi]
+            \\mov r11, rdi
+            \\vbroadcastss zmm8, dword ptr [r11]
+            \\vfmadd231ps zmm0, zmm8, zmm9
+            \\add r11, r10
+            \\vbroadcastss zmm8, dword ptr [r11]
+            \\vfmadd231ps zmm1, zmm8, zmm9
+            \\add r11, r10
+            \\vbroadcastss zmm8, dword ptr [r11]
+            \\vfmadd231ps zmm2, zmm8, zmm9
+            \\add r11, r10
+            \\vbroadcastss zmm8, dword ptr [r11]
+            \\vfmadd231ps zmm3, zmm8, zmm9
+            \\add r11, r10
+            \\vbroadcastss zmm8, dword ptr [r11]
+            \\vfmadd231ps zmm4, zmm8, zmm9
+            \\add r11, r10
+            \\vbroadcastss zmm8, dword ptr [r11]
+            \\vfmadd231ps zmm5, zmm8, zmm9
+            \\add r11, r10
+            \\vbroadcastss zmm8, dword ptr [r11]
+            \\vfmadd231ps zmm6, zmm8, zmm9
+            \\add r11, r10
+            \\vbroadcastss zmm8, dword ptr [r11]
+            \\vfmadd231ps zmm7, zmm8, zmm9
+            \\add rdi, 4
+            \\add rsi, 64
+            \\dec rcx
+            \\jnz .Lgemm512_loop
+            \\.Lgemm512_store:
+            \\vmovaps zmmword ptr [rdx], zmm0
+            \\vmovaps zmmword ptr [rdx + 64], zmm1
+            \\vmovaps zmmword ptr [rdx + 128], zmm2
+            \\vmovaps zmmword ptr [rdx + 192], zmm3
+            \\vmovaps zmmword ptr [rdx + 256], zmm4
+            \\vmovaps zmmword ptr [rdx + 320], zmm5
+            \\vmovaps zmmword ptr [rdx + 384], zmm6
+            \\vmovaps zmmword ptr [rdx + 448], zmm7
+            \\vzeroupper
+            \\.att_syntax prefix
+            :
+            : [a] "{rdi}" (a_ptr),
+              [b] "{rsi}" (b_ptr),
+              [c] "{rdx}" (c_ptr),
+              [k] "{rcx}" (k),
+            : "rcx", "rdx", "rsi", "rdi", "r10", "r11", "cc", "memory", "zmm0", "zmm1", "zmm2", "zmm3", "zmm4", "zmm5", "zmm6", "zmm7", "zmm8", "zmm9"
+        );
     } else {
         unreachable;
     }
@@ -862,7 +862,6 @@ fn workerMain(context: *GemmContext, worker_id: usize) void {
                 if (ic >= context.m) break;
                 const mc = @min(MC, context.m - ic);
 
-
                 const packed_a_len = @as(usize, mc) * @as(usize, kc);
                 packA(context.a[ic * context.lda + pc ..], context.lda, mc, kc, packed_a_storage[0..packed_a_len]);
                 var jr: usize = 0;
@@ -904,7 +903,7 @@ fn workerMain(context: *GemmContext, worker_id: usize) void {
                                     context.c[c_offset..][0..NR],
                                 );
                             }
-                            const a_pointer: [*]align(32) const f32 = @ptrCast(@alignCast(packed_a_storage.ptr + ir * kc));
+                            const a_pointer: [*]const f32 = packed_a_storage.ptr + ir * kc;
                             const b_pointer: [*]align(32) const f32 = @ptrCast(@alignCast(packed_b_storage.ptr + b_offset));
                             const tile_pointer: [*]align(32) f32 = @ptrCast(&tile);
                             microKernelAvx2(a_pointer, b_pointer, tile_pointer, kc);
@@ -1218,7 +1217,6 @@ pub const Shape = struct {
     }
 
     pub fn deinit(self: *Shape, allocator: Allocator) void {
-
         if (self.freed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
             return;
         }
@@ -1539,7 +1537,7 @@ pub const Tensor = struct {
 
     pub fn initIndexPayload(allocator: Allocator, model_id: u64, dim: usize) !Tensor {
         if (model_id == 0 or dim == 0) return Error.InvalidDimension;
-        return Tensor.initBound(allocator, &.{ dim * 2 }, types.RSFBinding.model(.index_payload, model_id, dim));
+        return Tensor.initBound(allocator, &.{dim * 2}, types.RSFBinding.model(.index_payload, model_id, dim));
     }
 
     pub fn binding(self: *const Tensor) ?types.RSFBinding {
@@ -3538,11 +3536,7 @@ pub fn globalDiffuseRowUnchecked(row: []f32, layout: types.RSFDiffusionLayout) v
             }
         }
     }
-    // Q_r := 2·v·vᵀ − I_r with v = (1/√r)·1_r. For r = 1 that is the 1×1
-    // identity, so there is NO negation step: Θ = Q_1 ⊗ H = H. (An earlier
-    // revision negated the row when r = 1, i.e. Θ = −H, which disagreed with
-    // `globalDiffuseRowF64` by a global sign even though both are
-    // involutions.)
+
     if (layout.radix == 1) return;
     const m = layout.block;
     const r = layout.radix;
@@ -3571,7 +3565,7 @@ pub fn globalDiffuseRowUnchecked(row: []f32, layout: types.RSFDiffusionLayout) v
 
 pub fn mixRadixBlocksInPlace(data: []f32, layout: types.RSFDiffusionLayout) Error!void {
     if (!diffusionLayoutIsApplicable(data.len, layout)) return Error.InvalidDiffusionLayout;
-    // Q_1 is the 1×1 identity, so the radix mix is a no-op for r = 1.
+
     if (layout.radix == 1) return;
     var tile: [diffusion_tile]f32 = undefined;
     var offset: usize = 0;
@@ -3598,14 +3592,6 @@ pub fn walshHadamardInPlace(data: []f32) Error!void {
     try hadamardBlockInPlace(data);
 }
 
-/// Reusable f64 scratch for the accuracy-contracted diffusion path.
-///
-/// The butterfly accumulates `stages` rounding errors per element, and in f32
-/// that grows past the 1e-7 involution bound of gate 12 (measured 8.9e-7 at
-/// `row_len = 98304`). The accumulated intermediates are therefore kept in f64
-/// and rounded to f32 exactly once. The buffers are thread-local and grown on
-/// demand, so a steady-state traversal performs no allocation at all; they are
-/// a process-lifetime cache and are intentionally never released.
 fn diffusionScratchF64(row_len: usize, block: usize) Error!struct { work: []f64, scratch: []f64 } {
     if (diffusion_work.len < row_len) {
         if (diffusion_work.len > 0) std.heap.page_allocator.free(diffusion_work);
@@ -3621,21 +3607,12 @@ fn diffusionScratchF64(row_len: usize, block: usize) Error!struct { work: []f64,
 threadlocal var diffusion_work: []f64 = &.{};
 threadlocal var diffusion_scratch: []f64 = &.{};
 
-/// `Θ = Q_r ⊗ H_{2^k}` with f64 accumulation. This is the
-/// exactness-contracted diffusion: it is what the model's layer map uses, and
-/// it is the path the involution and energy-preservation gates are measured on.
 pub fn diffuseRowAccurateInPlace(row: []f32, layout: types.RSFDiffusionLayout) Error!void {
     if (!diffusionLayoutIsApplicable(row.len, layout)) return Error.InvalidDiffusionLayout;
     const buffers = try diffusionScratchF64(layout.row_len, layout.block);
     try globalDiffuseRowF64(row, layout, buffers.work, buffers.scratch);
 }
 
-/// `Θ` on one latent row, in place, allocating nothing per stage.
-///
-/// Operates strictly on the caller's buffer and touches the row at most twice
-/// per call. The accumulation is f64 (`diffuseRowAccurateInPlace`) because the
-/// f32 butterfly drifts past the 1e-7 involution bound on long rows; the
-/// throughput-oriented f32 stack kernel is `globalDiffuseRowsStack`.
 pub fn diffuseRowInPlace(row: []f32, layout: types.RSFDiffusionLayout) Error!void {
     return diffuseRowAccurateInPlace(row, layout);
 }
@@ -3758,7 +3735,6 @@ pub fn causalCouplingForward(
             trans[d] = shift;
             y2[base + d] = x2[base + d] + shift;
         }
-
     }
     return logdet;
 }
@@ -3804,7 +3780,6 @@ pub fn causalCouplingInverse(
             scale[d] = factor;
             x1[base + d] = y1[base + d] / factor;
         }
-
     }
     return logdet;
 }
@@ -3922,7 +3897,6 @@ pub fn causalPrefixSum(mask: *const types.RSFSequenceMask, x2: []const f32, dim:
         mask.rowSetBits(t, &ctx, Acc.visit);
     }
 }
-
 
 fn validateLatentBatchBinding(state: *const Tensor, dim: usize, required_space: types.RSFSpace) !void {
     if (state.shape.dims.len != 3 or state.shape.dims[1] != dim or state.shape.dims[2] != 2) return Error.ShapeMismatch;
