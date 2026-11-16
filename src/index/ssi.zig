@@ -471,12 +471,6 @@ pub const SSI = struct {
         if (self.dim != dim) return Error.RSFModelMismatch;
         const anchor_hash = if (is_anchor) computeAnchorHash(tokens, position) else 0;
         try self.addSequenceWithMetadata(tokens, position, 0.0, anchor_hash, latent, log_det, 1);
-        if (self.size > 0) {
-            const load_factor = @as(f64, @floatFromInt(self.size)) / @as(f64, @floatFromInt(bucket_count));
-            if (load_factor > 8.0) {
-                try self.compact();
-            }
-        }
     }
 
     pub fn addLatent(self: *SSI, model: anytype, state: anytype, tokens: []const u32, position: u64, is_anchor: bool) !void {

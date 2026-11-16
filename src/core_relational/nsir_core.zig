@@ -956,12 +956,6 @@ pub const SelfSimilarRelationalGraph = struct {
         return null;
     }
 
-    /// Mutable counterpart of `getEdgesConst`. Returns a slice over the edge
-    /// list stored under `(source, target)` so callers can update weights in
-    /// place. Returns `null` when either endpoint is missing or no edge list
-    /// exists for the ordered pair. `topology_hash` is *not* invalidated: edge
-    /// weights are signal, not topology, and `markTopologyDirty` is reserved
-    /// for structural changes (node/edge insertion and removal).
     pub fn getEdgesMut(self: *SelfSimilarRelationalGraph, source: []const u8, target: []const u8) ?[]Edge {
         const s_node = self.nodes.getPtr(source) orelse return null;
         const t_node = self.nodes.getPtr(target) orelse return null;
@@ -970,10 +964,6 @@ pub const SelfSimilarRelationalGraph = struct {
         return null;
     }
 
-    /// Overwrites the weight of every stored edge of the ordered pair. Returns
-    /// the number of edges updated; `0` when the pair carries no edge, and
-    /// `error.NodeNotFound` when an endpoint is absent. Non-finite weights are
-    /// rejected with `error.InvalidWeight` before any mutation.
     pub fn updateEdgeWeight(self: *SelfSimilarRelationalGraph, source: []const u8, target: []const u8, weight: f64) !usize {
         if (!std.math.isFinite(weight)) return error.InvalidWeight;
         const s_node = self.nodes.getPtr(source) orelse return error.NodeNotFound;
@@ -984,9 +974,6 @@ pub const SelfSimilarRelationalGraph = struct {
         return list.items.len;
     }
 
-    /// Returns the stored edge weight of the first edge of the ordered pair,
-    /// or `null` when the pair is absent. Used by tests to assert that
-    /// `computeGraphLatents` really wrote the cosine through this API.
     pub fn edgeWeight(self: *const SelfSimilarRelationalGraph, source: []const u8, target: []const u8) ?f64 {
         const edges = self.getEdgesConst(source, target) orelse return null;
         if (edges.len == 0) return null;
@@ -1736,7 +1723,7 @@ pub const SelfSimilarRelationalGraph = struct {
             const tgt_idx = @as(usize, @intCast(tgt_i64));
             if (src_idx >= hashes.len or tgt_idx >= hashes.len) continue;
             if (src_idx == tgt_idx) continue;
-            var e = try Edge.init(
+            const e = try Edge.init(
                 self.allocator,
                 id_bufs[src_idx][0..],
                 id_bufs[tgt_idx][0..],
@@ -1745,8 +1732,6 @@ pub const SelfSimilarRelationalGraph = struct {
                 Complex(f64).init(0.0, 0.0),
                 0.0,
             );
-            var edge_transferred = false;
-            defer if (!edge_transferred) e.deinit();
             self.addEdge(id_bufs[src_idx][0..], id_bufs[tgt_idx][0..], e) catch |err| switch (err) {
                 error.SourceNodeNotFound, error.TargetNodeNotFound => {
                     std.debug.print(
@@ -1758,7 +1743,6 @@ pub const SelfSimilarRelationalGraph = struct {
                 },
                 else => return err,
             };
-            edge_transferred = true;
         }
         if (skipped_edges > 0) {
             std.debug.print(

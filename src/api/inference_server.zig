@@ -1,4 +1,5 @@
 const std = @import("std");
+const http_framing = @import("http_framing.zig");
 const net = std.net;
 const mem = std.mem;
 const fs = std.fs;
@@ -244,7 +245,8 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
     const columns: usize = 2;
     const matrix_length = std.math.mul(usize, rsf_dim, columns) catch return error.InvalidCheckpointModel;
     const stack_length = std.math.mul(usize, matrix_length, layer_count) catch return error.InvalidCheckpointModel;
-    const stack_state_bytes = std.math.mul(usize, stack_length, @sizeOf(f32) * 6) catch return error.InvalidCheckpointModel;
+    const fisher_length = try std.math.mul(usize, try std.math.mul(usize, rsf_dim, 3), layer_count);
+    const stack_state_bytes = std.math.mul(usize, stack_length, @sizeOf(f32) * 7) catch return error.InvalidCheckpointModel;
     if (stack_state_bytes > stat.size) return error.InvalidCheckpointStructure;
 
     const master_s = try allocator.alloc(f32, stack_length);
@@ -255,8 +257,8 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
     try checkpointReadExpectedF32Array(&reader, master_t, false);
     try checkpointValidateExpectedF32Array(&reader, stack_length, false);
     try checkpointValidateExpectedF32Array(&reader, stack_length, false);
-    try checkpointValidateExpectedF32Array(&reader, stack_length, true);
-    try checkpointValidateExpectedF32Array(&reader, stack_length, true);
+    try checkpointValidateExpectedF32Array(&reader, fisher_length, false);
+    try checkpointValidateExpectedF32Array(&reader, fisher_length, false);
 
     var model = try ModelFormat.init(allocator, "JAIDE Distributed Checkpoint", "Distributed trainer checkpoint");
     errdefer model.deinit();
@@ -275,6 +277,7 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
     }
     rsf_ptr.ctrl.?.cfg.clip_min = clip_min;
     rsf_ptr.ctrl.?.cfg.clip_max = clip_max;
+    try rsf_ptr.notifyWeightsChanged();
 
     const has_embedding = try reader.readByte();
     if (has_embedding != 1) return error.MissingCheckpointEmbedding;
@@ -375,6 +378,7 @@ const RateLimiter = struct {
     mutex: Thread.Mutex,
     window_seconds: u64,
     max_requests: u32,
+    next_cleanup: i64,
 
     pub fn init(allocator: Allocator, max_requests_per_minute: u32) RateLimiter {
         return RateLimiter{
@@ -384,6 +388,7 @@ const RateLimiter = struct {
             .mutex = Thread.Mutex{},
             .window_seconds = 60,
             .max_requests = max_requests_per_minute,
+            .next_cleanup = 0,
         };
     }
 
@@ -410,19 +415,33 @@ const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const result = self.logs.getOrPut(ip_address) catch return error.OutOfMemory;
-        if (!result.found_existing) {
-            const owned_key = self.allocator.dupe(u8, ip_address) catch return error.OutOfMemory;
-            self.key_storage.append(owned_key) catch {
-                self.allocator.free(owned_key);
-                return error.OutOfMemory;
-            };
-            result.key_ptr.* = owned_key;
-            result.value_ptr.* = RequestLog{
+        if (now >= self.next_cleanup) {
+            var key_index: usize = 0;
+            while (key_index < self.key_storage.items.len) {
+                const key = self.key_storage.items[key_index];
+                const entry = self.logs.getPtr(key).?;
+                if (entry.timestamps.items.len == 0 or entry.timestamps.items[entry.timestamps.items.len - 1] < cutoff) {
+                    entry.timestamps.deinit();
+                    _ = self.logs.remove(key);
+                    self.allocator.free(self.key_storage.swapRemove(key_index));
+                } else {
+                    key_index += 1;
+                }
+            }
+            self.next_cleanup = now + @as(i64, @intCast(self.window_seconds));
+        }
+        if (!self.logs.contains(ip_address)) {
+            if (self.logs.count() >= 65536) return false;
+            const owned_key = try self.allocator.dupe(u8, ip_address);
+            errdefer self.allocator.free(owned_key);
+            try self.key_storage.append(owned_key);
+            errdefer _ = self.key_storage.pop();
+            try self.logs.put(owned_key, .{
                 .timestamps = std.ArrayList(i64).init(self.allocator),
                 .mutex = Thread.Mutex{},
-            };
+            });
         }
+        const result = .{ .value_ptr = self.logs.getPtr(ip_address).? };
 
         var log = result.value_ptr;
         log.mutex.lock();
@@ -1068,13 +1087,11 @@ pub const InferenceServer = struct {
     fn handleStreamConnection(self: *InferenceServer, stream: net.Stream, client_addr: net.Address) !void {
         defer stream.close();
 
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const temp_allocator = arena.allocator();
-
         var ip_buf: [128]u8 = undefined;
-        const ip_len = std.fmt.bufPrint(&ip_buf, "{}", .{client_addr}) catch return;
-        const ip_str = try temp_allocator.dupe(u8, ip_len);
+        var rate_address = client_addr;
+        rate_address.setPort(0);
+        const ip_len = std.fmt.bufPrint(&ip_buf, "{}", .{rate_address}) catch return;
+        const ip_str = ip_len;
 
         var request_buf = std.ArrayList(u8).init(self.allocator);
         defer request_buf.deinit();
@@ -1085,8 +1102,9 @@ pub const InferenceServer = struct {
         var is_first_request = true;
 
         while (true) {
-            request_buf.clearRetainingCapacity();
-
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const temp_allocator = arena.allocator();
             if (is_first_request) {
                 setSocketTimeout(stream, self.config.request_timeout_ms);
             } else {
@@ -1094,97 +1112,27 @@ pub const InferenceServer = struct {
             }
             is_first_request = false;
 
-            var headers_found = false;
-            var total_read: usize = 0;
-            while (total_read < self.config.max_request_size_bytes) {
-                const bytes_read = stream.read(tmp_buf) catch break;
+            const frame = while (true) {
+                if (http_framing.parse(request_buf.items, self.config.max_request_size_bytes) catch |err| {
+                    try self.sendError(stream, if (err == error.RequestTooLarge) "Request too large" else "Invalid HTTP request", if (err == error.RequestTooLarge) @as(u16, 413) else @as(u16, 400));
+                    return;
+                }) |parsed| break parsed;
+                const available = self.config.max_request_size_bytes - request_buf.items.len;
+                const bytes_read = try stream.read(tmp_buf[0..@min(available, tmp_buf.len)]);
                 if (bytes_read == 0) return;
                 try request_buf.appendSlice(tmp_buf[0..bytes_read]);
-                total_read += bytes_read;
-
-                if (mem.indexOf(u8, request_buf.items, "\r\n\r\n")) |_| {
-                    headers_found = true;
-                    break;
-                }
+            };
+            while (request_buf.items.len < frame.request_end) {
+                const to_read = @min(frame.request_end - request_buf.items.len, tmp_buf.len);
+                const bytes_read = try stream.read(tmp_buf[0..to_read]);
+                if (bytes_read == 0) return error.InvalidRequest;
+                try request_buf.appendSlice(tmp_buf[0..bytes_read]);
             }
-
-            if (!headers_found or request_buf.items.len == 0) return;
-
-            if (request_buf.items.len >= self.config.max_request_size_bytes) {
-                try self.sendError(stream, "Request too large", 413);
-                return;
-            }
-
-            const request_data = request_buf.items;
-
-            const method_end = mem.indexOf(u8, request_data, " ") orelse return error.InvalidRequest;
-            const method = request_data[0..method_end];
-
-            const path_start = method_end + 1;
-            const path_end = mem.indexOfPos(u8, request_data, path_start, " ") orelse return error.InvalidRequest;
-            const path = request_data[path_start..path_end];
-
-            const headers_end = mem.indexOf(u8, request_data, "\r\n\r\n") orelse return error.InvalidRequest;
-            const headers = request_data[0..headers_end];
-
-            var content_length: usize = 0;
-            var header_lines = mem.splitSequence(u8, headers, "\r\n");
-            while (header_lines.next()) |line| {
-                if (line.len >= 16) {
-                    var lower_buf: [64]u8 = undefined;
-                    const prefix = line[0..@min(line.len, 15)];
-                    var pi: usize = 0;
-                    while (pi < prefix.len) : (pi += 1) {
-                        lower_buf[pi] = std.ascii.toLower(prefix[pi]);
-                    }
-                    if (mem.eql(u8, lower_buf[0..15], "content-length:")) {
-                        const colon_idx = mem.indexOf(u8, line, ":") orelse continue;
-                        const val = mem.trim(u8, line[colon_idx + 1 ..], " \t");
-                        content_length = std.fmt.parseInt(usize, val, 10) catch 0;
-                    }
-                }
-            }
-
-            const body_start = headers_end + 4;
-            const body = if (body_start < request_data.len) request_data[body_start..] else "";
-
-            if (body.len < content_length and content_length <= self.config.max_request_size_bytes) {
-                var total_body_read: usize = body.len;
-                while (total_body_read < content_length) {
-                    const remaining = content_length - total_body_read;
-                    const to_read = @min(remaining, tmp_buf.len);
-                    const bytes_read = stream.read(tmp_buf[0..to_read]) catch break;
-                    if (bytes_read == 0) break;
-                    try request_buf.appendSlice(tmp_buf[0..bytes_read]);
-                    total_body_read += bytes_read;
-                    _ = request_buf.items[body_start..];
-                }
-            }
-
-            var connection_keep_alive = false;
-            var conn_header_lines = mem.splitSequence(u8, headers, "\r\n");
-            while (conn_header_lines.next()) |line| {
-                if (line.len >= 12) {
-                    var lower_buf2: [64]u8 = undefined;
-                    const prefix2 = line[0..@min(line.len, 11)];
-                    var pi2: usize = 0;
-                    while (pi2 < prefix2.len) : (pi2 += 1) {
-                        lower_buf2[pi2] = std.ascii.toLower(prefix2[pi2]);
-                    }
-                    if (mem.eql(u8, lower_buf2[0..11], "connection:")) {
-                        const colon_idx2 = mem.indexOf(u8, line, ":") orelse continue;
-                        const val2 = mem.trim(u8, line[colon_idx2 + 1 ..], " \t");
-                        var lower_val: [32]u8 = undefined;
-                        var vi: usize = 0;
-                        while (vi < @min(val2.len, 31)) : (vi += 1) {
-                            lower_val[vi] = std.ascii.toLower(val2[vi]);
-                        }
-                        if (mem.indexOf(u8, lower_val[0..vi], "keep-alive") != null) {
-                            connection_keep_alive = true;
-                        }
-                    }
-                }
-            }
+            const method = request_buf.items[0..frame.method_end];
+            const path = request_buf.items[frame.path_start..frame.path_end];
+            const headers = request_buf.items[0..frame.headers_end];
+            const body = request_buf.items[frame.body_start..frame.request_end];
+            const connection_keep_alive = frame.keep_alive;
 
             if (mem.eql(u8, method, "GET") and mem.eql(u8, path, "/v1/health")) {
                 try self.handleHealth(stream, temp_allocator, connection_keep_alive);
@@ -1226,6 +1174,7 @@ pub const InferenceServer = struct {
             }
 
             if (!connection_keep_alive) return;
+            try http_framing.consume(&request_buf, frame.request_end);
         }
     }
 
@@ -1279,9 +1228,12 @@ pub const InferenceServer = struct {
         const uptime_ms = now_ms - start_ms;
         const uptime_seconds: u64 = if (uptime_ms >= 0) @intCast(@divTrunc(uptime_ms, 1000)) else 0;
 
+        self.inference_mutex.lock();
+        const model_loaded = self.isModelLoaded();
+        self.inference_mutex.unlock();
         const response = HealthResponse{
             .uptime_seconds = uptime_seconds,
-            .model_loaded = self.isModelLoaded(),
+            .model_loaded = model_loaded,
         };
 
         const json = try response.toJson(allocator);
@@ -1308,6 +1260,8 @@ pub const InferenceServer = struct {
     }
 
     fn handleInference(self: *InferenceServer, stream: net.Stream, body: []const u8, allocator: Allocator, keep_alive: bool) !void {
+        self.inference_mutex.lock();
+        defer self.inference_mutex.unlock();
         if (!self.isModelLoaded()) {
             try self.sendError(stream, "Model not loaded", 503);
             return;
@@ -1328,17 +1282,10 @@ pub const InferenceServer = struct {
             return;
         };
 
-        const max_tokens = request.max_tokens orelse tokens.items.len;
-        const final_tokens = if (tokens.items.len > max_tokens)
-            tokens.items[0..max_tokens]
-        else
-            tokens.items;
+        const final_tokens = tokens.items;
 
         var embeddings: ?[]f32 = null;
-        errdefer if (embeddings) |emb| allocator.free(emb);
-
-        self.inference_mutex.lock();
-        defer self.inference_mutex.unlock();
+        defer if (embeddings) |emb| allocator.free(emb);
 
         if (self.model.?.rsf != null) {
             const dim = (self.model.?.rsf.?.ctrl orelse {
@@ -1353,7 +1300,7 @@ pub const InferenceServer = struct {
             defer if (emb_tensor) |*t| t.deinit();
 
             var input_tensor = if (emb_tensor) |et| blk: {
-                var t = try Tensor.init(allocator, &.{ 1, dim * 2 });
+                var t = try Tensor.init(allocator, &.{ @max(final_tokens.len, 1), dim * 2 });
                 const copy_len = @min(et.data.len, t.data.len);
                 @memcpy(t.data[0..copy_len], et.data[0..copy_len]);
                 if (copy_len < t.data.len) @memset(t.data[copy_len..], 0.0);
@@ -1555,6 +1502,7 @@ pub const InferenceServer = struct {
         _ = self.request_count.fetchAdd(1, .monotonic);
 
         var owned_embeddings: ?[]f32 = embeddings;
+        embeddings = null;
         var owned_input_tokens: ?[]u32 = null;
         var owned_generated_text: ?[]const u8 = null;
         var owned_generated_tokens: ?[]u32 = null;
@@ -1619,29 +1567,6 @@ pub const InferenceServer = struct {
                 }
             }
 
-            if (self.ssi) |*ssi_idx| {
-                if (self.ranker) |*rnk| {
-                    if (self.model.?.rsf) |base_model| {
-                        var query_state = RSFLatentState.init(allocator, base_model, 1) catch null;
-                        if (query_state) |*state| {
-                            defer state.deinit();
-                            const top_candidates = rnk.topKHeap(ssi_idx, generated.items, state, base_model, 5, allocator) catch null;
-                            if (top_candidates) |cands| {
-                                defer {
-                                    for (cands) |*c| {
-                                        c.deinit(allocator);
-                                    }
-                                    allocator.free(cands);
-                                }
-                                if (cands.len > 0 and cands[0].tokens.len > 0) {
-                                    next_token = cands[0].tokens[0];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             if (next_token == 0) {
                 if (self.ssi) |*ssi_idx| {
                     if (generated.items.len > 0) {
@@ -1700,7 +1625,7 @@ pub const InferenceServer = struct {
             .tokens = generated_tokens_slice,
             .text = generated_text,
             .input_tokens = input_tokens_copy,
-            .embeddings = embeddings,
+            .embeddings = owned_embeddings,
             .processing_time_ms = processing_time,
         };
         owned_embeddings = null;
@@ -1733,6 +1658,8 @@ pub const InferenceServer = struct {
     }
 
     fn handleBatchInference(self: *InferenceServer, stream: net.Stream, body: []const u8, allocator: Allocator, keep_alive: bool) !void {
+        self.inference_mutex.lock();
+        defer self.inference_mutex.unlock();
         if (!self.isModelLoaded()) {
             try self.sendError(stream, "Model not loaded", 503);
             return;
@@ -1773,11 +1700,8 @@ pub const InferenceServer = struct {
 
             const max_gen_tokens = batch_req.max_tokens orelse 32;
 
-            self.inference_mutex.lock();
-
             if (self.model.?.rsf != null) {
                 const dim = (self.model.?.rsf.?.ctrl orelse {
-                    self.inference_mutex.unlock();
                     try writer.writeAll("{\"error\":\"RSF not initialized\"}");
                     continue;
                 }).dim;
@@ -1790,7 +1714,7 @@ pub const InferenceServer = struct {
 
                 if (emb_tensor) |et| {
                     var input_tensor = blk: {
-                        var t = Tensor.init(allocator, &.{ 1, dim * 2 }) catch break;
+                        var t = try Tensor.init(allocator, &.{ @max(tokens.items.len, 1), dim * 2 });
                         const copy_len = @min(et.data.len, t.data.len);
                         @memcpy(t.data[0..copy_len], et.data[0..copy_len]);
                         if (copy_len < t.data.len) @memset(t.data[copy_len..], 0.0);
@@ -1949,29 +1873,6 @@ pub const InferenceServer = struct {
                     }
                 }
 
-                if (self.ssi) |*ssi_idx| {
-                    if (self.ranker) |*rnk| {
-                        if (self.model.?.rsf) |base_model| {
-                            var query_state = RSFLatentState.init(allocator, base_model, 1) catch null;
-                            if (query_state) |*state| {
-                                defer state.deinit();
-                                const top_candidates = rnk.topKHeap(ssi_idx, generated.items, state, base_model, 5, allocator) catch null;
-                                if (top_candidates) |cands| {
-                                    defer {
-                                        for (cands) |*c| {
-                                            c.deinit(allocator);
-                                        }
-                                        allocator.free(cands);
-                                    }
-                                    if (cands.len > 0 and cands[0].tokens.len > 0) {
-                                        next_token = cands[0].tokens[0];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 if (next_token == 0) {
                     if (self.ssi) |*ssi_idx| {
                         if (generated.items.len > 0) {
@@ -2006,8 +1907,6 @@ pub const InferenceServer = struct {
                 if (next_token == 0) break;
                 try generated.append(next_token);
             }
-
-            self.inference_mutex.unlock();
 
             _ = self.request_count.fetchAdd(1, .monotonic);
 

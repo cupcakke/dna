@@ -36,7 +36,7 @@ let fwht_stages [n] (x: [n]f32) (block: i64) (stages: i64) : [n]f32 =
     in final
 
 let mix_radix_blocks [n] (x: [n]f32) (block: i64) (radix: i64) : [n]f32 =
-  if block <= 0 || radix <= 0 then x
+  if block <= 0 || radix <= 1 then x
   else
     let coeff = 2f32 / f32.i64 radix
     in tabulate n (\i ->
@@ -645,14 +645,9 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
   let recon_loss = recon_total / count_elements_f32
   let logdet_total = reduce (+) 0f32 ld_stack
   let logdet_mean = sanitize_f32 (logdet_total / count_tokens_f32)
-  let active_input_delta = map3 (\g_row x_row o_row ->
-    map3 (\gv xv ov ->
-      let base = forward_scale * gradient_scale * sanitize_f32 gv
-      let diff = xv - f32.f16 ov
-      let safe_diff = f32.max (-100f32) (f32.min 100f32 (sanitize_f32 diff))
-      let combined = sanitize_f32 (base + reconstruction_alpha * 2f32 * safe_diff / gradient_element_divisor)
-      in f16.f32 (f32.max (-65504f32) (f32.min 65504f32 combined))) g_row x_row o_row
-    ) g_stack x_stack active_orig
+  let active_input_delta = map (map (\gv ->
+    let combined = sanitize_f32 (forward_scale * gradient_scale * sanitize_f32 gv)
+    in f16.f32 (f32.max (-65504f32) (f32.min 65504f32 combined)))) g_stack
   let zero_delta = replicate (batch_size * seq_len) (replicate (half * 2) 0f16)
   let input_delta = scatter zero_delta active_indices active_input_delta
   let input_delta_3d = unflatten input_delta :> [batch_size][seq_len][half*2]f16
